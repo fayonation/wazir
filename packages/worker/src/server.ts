@@ -16,6 +16,7 @@ import {
   buildModifyResponse,
 } from "./claudeHook.js";
 import { createLogger, type WorkerLogger } from "./logger.js";
+import { readModelFromTranscript, prettyModel } from "./transcript.js";
 
 export interface WorkerStartOptions {
   workerId: string;
@@ -112,6 +113,9 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
       },
     );
 
+    const modelId = readModelFromTranscript(payload.transcript_path);
+    const modelLabel = prettyModel(modelId);
+
     try {
       await hubClient.submitApproval({
         request_id: requestId,
@@ -123,6 +127,10 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
           cwd: payload.cwd,
           tool_name: payload.tool_name,
           risk_class: risk.pattern?.label,
+          extra: {
+            ...(modelId ? { model_id: modelId } : {}),
+            ...(modelLabel ? { model_label: modelLabel } : {}),
+          },
         },
         callback_url: callbackUrl,
         timeout_seconds: approvalTimeoutSeconds,

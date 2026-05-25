@@ -8,6 +8,13 @@ import { runHub } from "./commands/hub.js";
 import { runWorker } from "./commands/worker.js";
 import { runStatus } from "./commands/status.js";
 import { runLog } from "./commands/log.js";
+import { runDoctor } from "./commands/doctor.js";
+import {
+  runInstallService,
+  runUninstallService,
+  runServiceStatus,
+  runServiceRestart,
+} from "./commands/service.js";
 
 const program = new Command();
 
@@ -52,6 +59,43 @@ program
   .option("--limit <n>", "how many records to show", "20")
   .action(async (opts) => {
     await runLog({ limit: opts.limit });
+  });
+
+program
+  .command("doctor")
+  .description("Run a health check (Node version, config, hub, worker, Telegram, hook).")
+  .action(async () => {
+    await runDoctor();
+  });
+
+program
+  .command("install-service")
+  .description("Install hub + worker as macOS LaunchAgents (auto-start on login).")
+  .option("--force", "overwrite existing plists if present")
+  .action(async (opts) => {
+    await runInstallService({ force: Boolean(opts.force) });
+  });
+
+program
+  .command("uninstall-service")
+  .description("Remove hub + worker LaunchAgents.")
+  .action(async () => {
+    await runUninstallService();
+  });
+
+program
+  .command("service")
+  .description("Manage the installed LaunchAgents.")
+  .argument("<action>", "status | restart")
+  .action(async (action: string) => {
+    if (action === "status") {
+      await runServiceStatus();
+    } else if (action === "restart") {
+      await runServiceRestart();
+    } else {
+      console.error(`unknown service action: ${action} (expected 'status' or 'restart')`);
+      process.exitCode = 1;
+    }
   });
 
 program.parseAsync(process.argv).catch((err: unknown) => {

@@ -278,6 +278,9 @@ function buildNotification(approvalId: string, req: ApprovalRequest, now: number
   const cwd = req.context.cwd ? ` : ${req.context.cwd}` : "";
   const body = `${req.command}\n@ ${req.worker_id}${cwd}`;
   const voicePrompt = `Approve a ${riskClass} from ${req.worker_id}?`;
+  const extra = (req.context.extra ?? {}) as Record<string, unknown>;
+  const modelLabel = typeof extra.model_label === "string" ? extra.model_label : undefined;
+  const modelId = typeof extra.model_id === "string" ? extra.model_id : undefined;
   return {
     type: "approval_request",
     approval_id: approvalId,
@@ -295,6 +298,8 @@ function buildNotification(approvalId: string, req: ApprovalRequest, now: number
       source: req.source,
       cwd: req.context.cwd,
       risk_class: req.context.risk_class,
+      ...(modelLabel ? { model_label: modelLabel } : {}),
+      ...(modelId ? { model_id: modelId } : {}),
     },
   };
 }

@@ -207,10 +207,14 @@ function extractCommand(body: string): string {
 
 function formatMessage(n: HubNotification, command: string, maxChars: number): string {
   const truncated = truncate(command, maxChars);
-  const workerId = (n.context as { worker_id?: string }).worker_id ?? "?";
-  const cwd = (n.context as { cwd?: string }).cwd;
+  const ctx = n.context as { worker_id?: string; cwd?: string; model_label?: string; source?: string };
+  const workerId = ctx.worker_id ?? "?";
+  const cwd = ctx.cwd;
   const cwdLine = cwd ? `\n_@ ${escapeMd(workerId)} : ${escapeMd(cwd)}_` : `\n_@ ${escapeMd(workerId)}_`;
-  return `*${escapeMd(n.title)}*\n\`\`\`\n${truncated}\n\`\`\`${cwdLine}`;
+  const modelLine = ctx.model_label
+    ? `\n_${escapeMd(ctx.source ?? "claude-code")} · ${escapeMd(ctx.model_label)}_`
+    : "";
+  return `*${escapeMd(n.title)}*\n\`\`\`\n${truncated}\n\`\`\`${cwdLine}${modelLine}`;
 }
 
 function truncate(s: string, max: number): string {
