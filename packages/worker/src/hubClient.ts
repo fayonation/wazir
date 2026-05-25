@@ -3,6 +3,7 @@ import {
   HMAC_HEADER_TIMESTAMP,
   signPayload,
   type ApprovalRequest,
+  type Session,
   type WorkerRegistration,
 } from "@wazir/protocol";
 
@@ -42,6 +43,10 @@ export class HubClient {
   async submitApproval(req: ApprovalRequest): Promise<{ approval_id: string }> {
     const res = await this.post("/v1/approvals", req);
     return res as { approval_id: string };
+  }
+
+  async reportSessions(workerId: string, sessions: Session[]): Promise<void> {
+    await this.post(`/v1/workers/${encodeURIComponent(workerId)}/sessions`, { sessions });
   }
 
   private async post(path: string, body: unknown): Promise<unknown> {

@@ -15,6 +15,14 @@ import {
   runServiceStatus,
   runServiceRestart,
 } from "./commands/service.js";
+import {
+  runSessionNew,
+  runSessionList,
+  runSessionAttach,
+  runSessionKill,
+  runSessionSend,
+  runSessionCapture,
+} from "./commands/session.js";
 
 const program = new Command();
 
@@ -66,6 +74,64 @@ program
   .description("Run a health check (Node version, config, hub, worker, Telegram, hook).")
   .action(async () => {
     await runDoctor();
+  });
+
+const session = program.command("session").description("Manage agent sessions (tmux-backed).");
+
+session
+  .command("new <agent>")
+  .description("Spawn a new agent session (defaults: agent=claude, cwd=$PWD).")
+  .option("--cwd <path>", "working directory for the agent")
+  .option("--label <text>", "human label for the session")
+  .action(async (agent: string, opts: { cwd?: string; label?: string }) => {
+    const args: { cwd?: string; label?: string } = {};
+    if (opts.cwd) args.cwd = opts.cwd;
+    if (opts.label) args.label = opts.label;
+    await runSessionNew(agent, args);
+  });
+
+session
+  .command("list")
+  .description("List sessions tracked by the hub.")
+  .option("--worker <id>", "filter by worker id")
+  .option("--cwd <path>", "filter by cwd")
+  .action(async (opts: { worker?: string; cwd?: string }) => {
+    const args: { workerId?: string; cwd?: string } = {};
+    if (opts.worker) args.workerId = opts.worker;
+    if (opts.cwd) args.cwd = opts.cwd;
+    await runSessionList(args);
+  });
+
+session
+  .command("attach <id-prefix>")
+  .description("Attach a terminal to the session's tmux pane (Ctrl-B D to detach).")
+  .action(async (idPrefix: string) => {
+    await runSessionAttach(idPrefix);
+  });
+
+session
+  .command("kill <id-prefix>")
+  .description("Kill a session's tmux pane and drop it from the registry.")
+  .action(async (idPrefix: string) => {
+    await runSessionKill(idPrefix);
+  });
+
+session
+  .command("send <id-prefix> <text...>")
+  .description("Type text into a session (debug helper — Phase 2 voice handler does this for real).")
+  .option("--no-enter", "do not press Enter after the text")
+  .action(async (idPrefix: string, textParts: string[], opts: { noEnter?: boolean }) => {
+    await runSessionSend(idPrefix, textParts.join(" "), { noEnter: Boolean(opts.noEnter) });
+  });
+
+session
+  .command("capture <id-prefix>")
+  .description("Read the session's tmux pane buffer.")
+  .option("--since <cursor>", "byte offset to start from (default: per-session delta cursor)")
+  .action(async (idPrefix: string, opts: { since?: string }) => {
+    const args: { since?: string } = {};
+    if (opts.since) args.since = opts.since;
+    await runSessionCapture(idPrefix, args);
   });
 
 program

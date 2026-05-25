@@ -1,19 +1,24 @@
 import express, { type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
+import { z } from "zod";
 import {
   ApprovalRequestSchema,
   WorkerRegistrationSchema,
   UserDecisionSchema,
+  SessionSpawnRequestSchema,
+  SessionInputRequestSchema,
+  SessionSchema,
   HMAC_HEADER_SIGNATURE,
   HMAC_HEADER_TIMESTAMP,
   signPayload,
   type ApprovalRequest,
   type HubNotification,
   type InterfaceAdapter,
+  type Session,
 } from "@wazir/protocol";
 import { openDatabase } from "./db.js";
-import { ApprovalStore, WorkerStore } from "./store.js";
+import { ApprovalStore, WorkerStore, SessionStore } from "./store.js";
 import { createHmacMiddleware, rawBodyCapture, type RawBodyRequest } from "./hmacMiddleware.js";
 import { RateLimiter } from "./rateLimit.js";
 import { AdapterRegistry } from "./adapterRegistry.js";
@@ -40,6 +45,7 @@ export async function startHub(opts: HubStartOptions): Promise<HubHandle> {
   const db = openDatabase(opts.dbPath);
   const approvals = new ApprovalStore(db);
   const workers = new WorkerStore(db);
+  const sessions = new SessionStore(db);
   const workerDecisionLimiter = new RateLimiter(60, 60_000);
   const workerSubmitLimiter = new RateLimiter(120, 60_000);
 
@@ -217,6 +223,175 @@ export async function startHub(opts: HubStartOptions): Promise<HubHandle> {
     const limitRaw = (_req.query.limit as string | undefined) ?? "20";
     const limit = Math.min(200, Math.max(1, Number.parseInt(limitRaw, 10) || 20));
     res.json({ approvals: approvals.recentApprovals(limit) });
+  });
+
+  // -----------------------------------------------------------------
+  // Session endpoints — hub-mediated CRUD. Hub forwards to worker by URL.
+  // -----------------------------------------------------------------
+
+  function pickWorker(workerId?: string) {
+    if (workerId) return workers.getWorker(workerId);
+    const all = workers.listWorkers();
+    return all[0];
+  }
+
+  async function forwardToWorker(
+    workerUrl: string,
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    body?: unknown,
+  ): Promise<{ status: number; body: unknown }> {
+    const raw = body === undefined ? "" : JSON.stringify(body);
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = signPayload(opts.hmacSecret, raw, ts);
+    const init: RequestInit = {
+      method,
+      headers: {
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        [HMAC_HEADER_SIGNATURE]: sig,
+        [HMAC_HEADER_TIMESTAMP]: String(ts),
+      },
+      ...(body !== undefined ? { body: raw } : {}),
+    };
+    const res = await fetch(`${workerUrl}${path}`, init);
+    let parsed: unknown = null;
+    try {
+      parsed = await res.json();
+    } catch {
+      parsed = null;
+    }
+    return { status: res.status, body: parsed };
+  }
+
+  app.post("/v1/sessions", hmac, async (req: RawBodyRequest, res: Response) => {
+    const parsed = SessionSpawnRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_body", details: parsed.error.flatten() });
+      return;
+    }
+    const workerIdRaw = req.query.worker_id;
+    const workerId = typeof workerIdRaw === "string" ? workerIdRaw : undefined;
+    const worker = pickWorker(workerId);
+    if (!worker || !worker.worker_url) {
+      res.status(503).json({ error: "no_worker_available" });
+      return;
+    }
+    try {
+      const result = await forwardToWorker(worker.worker_url, "POST", "/v1/sessions/spawn", parsed.data);
+      if (result.status !== 200) {
+        res.status(result.status).json(result.body ?? { error: "worker_error" });
+        return;
+      }
+      const session = SessionSchema.parse(result.body);
+      sessions.upsert(session);
+      res.status(201).json(session);
+    } catch (err) {
+      logger.error({ err }, "session spawn forwarding failed");
+      res.status(502).json({ error: "worker_unreachable", detail: (err as Error).message });
+    }
+  });
+
+  app.get("/v1/sessions", hmac, (req: RawBodyRequest, res: Response) => {
+    const workerIdRaw = req.query.worker_id;
+    const cwdRaw = req.query.cwd;
+    const rows = sessions.list({
+      workerId: typeof workerIdRaw === "string" ? workerIdRaw : undefined,
+      cwd: typeof cwdRaw === "string" ? cwdRaw : undefined,
+    });
+    res.json({ sessions: rows });
+  });
+
+  app.get("/v1/sessions/:session_id", hmac, (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const row = sessions.get(sessionId);
+    if (!row) { res.status(404).json({ error: "unknown_session" }); return; }
+    res.json(row);
+  });
+
+  app.post("/v1/sessions/:session_id/input", hmac, async (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const parsed = SessionInputRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_body", details: parsed.error.flatten() });
+      return;
+    }
+    const row = sessions.get(sessionId);
+    if (!row) { res.status(404).json({ error: "unknown_session" }); return; }
+    const worker = workers.getWorker(row.worker_id);
+    if (!worker || !worker.worker_url) {
+      res.status(503).json({ error: "worker_unavailable" });
+      return;
+    }
+    try {
+      const result = await forwardToWorker(
+        worker.worker_url,
+        "POST",
+        `/v1/sessions/${encodeURIComponent(sessionId)}/input`,
+        parsed.data,
+      );
+      res.status(result.status).json(result.body ?? {});
+    } catch (err) {
+      res.status(502).json({ error: "worker_unreachable", detail: (err as Error).message });
+    }
+  });
+
+  app.get("/v1/sessions/:session_id/capture", hmac, async (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const row = sessions.get(sessionId);
+    if (!row) { res.status(404).json({ error: "unknown_session" }); return; }
+    const worker = workers.getWorker(row.worker_id);
+    if (!worker || !worker.worker_url) {
+      res.status(503).json({ error: "worker_unavailable" });
+      return;
+    }
+    try {
+      const since = typeof req.query.since === "string" ? `?since=${encodeURIComponent(req.query.since)}` : "";
+      const result = await forwardToWorker(
+        worker.worker_url,
+        "GET",
+        `/v1/sessions/${encodeURIComponent(sessionId)}/capture${since}`,
+      );
+      res.status(result.status).json(result.body ?? {});
+    } catch (err) {
+      res.status(502).json({ error: "worker_unreachable", detail: (err as Error).message });
+    }
+  });
+
+  app.delete("/v1/sessions/:session_id", hmac, async (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const row = sessions.get(sessionId);
+    if (!row) { res.status(404).json({ error: "unknown_session" }); return; }
+    const worker = workers.getWorker(row.worker_id);
+    if (worker?.worker_url) {
+      try {
+        await forwardToWorker(
+          worker.worker_url,
+          "DELETE",
+          `/v1/sessions/${encodeURIComponent(sessionId)}`,
+        );
+      } catch (err) {
+        logger.warn({ err, session_id: sessionId }, "worker kill forwarding failed (will still drop from registry)");
+      }
+    }
+    sessions.delete(sessionId);
+    res.json({ ok: true });
+  });
+
+  // Workers post their current session list here on a periodic basis.
+  app.post("/v1/workers/:worker_id/sessions", hmac, (req: RawBodyRequest, res: Response) => {
+    const workerId = req.params.worker_id;
+    if (!workerId) { res.status(400).json({ error: "missing_worker_id" }); return; }
+    const list = z.array(SessionSchema).safeParse((req.body as { sessions?: unknown })?.sessions);
+    if (!list.success) {
+      res.status(400).json({ error: "invalid_body", details: list.error.flatten() });
+      return;
+    }
+    sessions.reconcile(workerId, list.data, Date.now());
+    res.json({ ok: true, count: list.data.length });
   });
 
   async function postCallback(url: string, body: {

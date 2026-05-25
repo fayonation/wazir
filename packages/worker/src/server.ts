@@ -4,6 +4,8 @@ import { hostname } from "node:os";
 import type { Server } from "node:http";
 import {
   ApprovalDecisionCallbackSchema,
+  SessionSpawnRequestSchema,
+  SessionInputRequestSchema,
   type RiskPattern,
 } from "@wazir/protocol";
 import { createHmacMiddleware, rawBodyCapture, type RawBodyRequest } from "./hmacMiddleware.js";
@@ -17,6 +19,7 @@ import {
 } from "./claudeHook.js";
 import { createLogger, type WorkerLogger } from "./logger.js";
 import { readModelFromTranscript, prettyModel } from "./transcript.js";
+import { TmuxManager } from "./tmux/index.js";
 
 export interface WorkerStartOptions {
   workerId: string;
@@ -50,13 +53,16 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
   const host = opts.hostname ?? hostname();
   const approvalTimeoutSeconds = opts.approvalTimeoutSeconds ?? 540;
   const pendingDecisions = new Map<string, PendingDecision>();
+  const tmuxManager = new TmuxManager(logger, opts.workerId);
+  const workerUrl = `http://${opts.bindHost}:${opts.bindPort}`;
 
   await hubClient.register({
     worker_id: opts.workerId,
     hostname: host,
     platform: process.platform,
     version: opts.version,
-    capabilities: ["claude-code-hook"],
+    capabilities: ["claude-code-hook", "tmux"],
+    worker_url: workerUrl,
   });
   logger.info({ hub_url: opts.hubUrl }, "registered with hub");
 
@@ -64,6 +70,14 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
     hubClient.heartbeat(opts.workerId).catch((err) => {
       logger.warn({ err }, "heartbeat failed");
     });
+    void (async () => {
+      try {
+        const sessions = await tmuxManager.listSessions();
+        await hubClient.reportSessions(opts.workerId, sessions);
+      } catch (err) {
+        logger.warn({ err }, "session report failed");
+      }
+    })();
   }, opts.heartbeatIntervalMs ?? 30_000);
   heartbeatTimer.unref();
 
@@ -162,6 +176,85 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
   });
 
   const hmac = createHmacMiddleware(opts.hmacSecret);
+
+  // ---------------------------------------------------------------
+  // Session endpoints — hub forwards CLI/adapter requests here.
+  // ---------------------------------------------------------------
+
+  app.post("/v1/sessions/spawn", hmac, async (req: RawBodyRequest, res: Response) => {
+    const parsed = SessionSpawnRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_body", details: parsed.error.flatten() });
+      return;
+    }
+    try {
+      const spawnOpts: Parameters<typeof tmuxManager.spawnSession>[0] = {
+        agent: parsed.data.agent,
+        cwd: parsed.data.cwd,
+        resume: parsed.data.resume,
+      };
+      if (parsed.data.session_id !== undefined) spawnOpts.sessionId = parsed.data.session_id;
+      if (parsed.data.label !== undefined) spawnOpts.label = parsed.data.label;
+      const session = await tmuxManager.spawnSession(spawnOpts);
+      res.status(200).json(session);
+    } catch (err) {
+      logger.error({ err }, "session spawn failed");
+      res.status(500).json({ error: "spawn_failed", detail: (err as Error).message });
+    }
+  });
+
+  app.get("/v1/sessions", hmac, async (_req: RawBodyRequest, res: Response) => {
+    try {
+      const list = await tmuxManager.listSessions();
+      res.json({ sessions: list });
+    } catch (err) {
+      res.status(500).json({ error: "list_failed", detail: (err as Error).message });
+    }
+  });
+
+  app.post("/v1/sessions/:session_id/input", hmac, async (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const parsed = SessionInputRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_body", details: parsed.error.flatten() });
+      return;
+    }
+    try {
+      await tmuxManager.sendInput(sessionId, parsed.data.text, parsed.data.press_enter);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "input_failed", detail: (err as Error).message });
+    }
+  });
+
+  app.get("/v1/sessions/:session_id/capture", hmac, async (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const sinceRaw = req.query.since;
+    const captureOpts: Parameters<typeof tmuxManager.capturePane>[1] = {};
+    if (typeof sinceRaw === "string") {
+      const parsed = Number.parseInt(sinceRaw, 10);
+      if (Number.isFinite(parsed) && parsed >= 0) captureOpts.since = parsed;
+    }
+    try {
+      const result = await tmuxManager.capturePane(sessionId, captureOpts);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: "capture_failed", detail: (err as Error).message });
+    }
+  });
+
+  app.delete("/v1/sessions/:session_id", hmac, async (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    try {
+      const killed = await tmuxManager.killSession(sessionId);
+      res.json({ ok: killed });
+    } catch (err) {
+      res.status(500).json({ error: "kill_failed", detail: (err as Error).message });
+    }
+  });
 
   app.post("/v1/decisions/:request_id", hmac, (req: RawBodyRequest, res: Response) => {
     const requestId = req.params.request_id;

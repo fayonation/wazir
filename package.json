@@ -21,6 +21,7 @@
     "wazir:doctor": "bash scripts/wazir.sh doctor",
     "wazir:install-service": "bash scripts/wazir.sh install-service",
     "wazir:uninstall-service": "bash scripts/wazir.sh uninstall-service",
+    "wazir:session": "bash scripts/wazir.sh session",
     "lint": "pnpm -r --filter './packages/**' run lint --if-present",
     "test": "pnpm -r --filter './packages/**' run test --if-present"
   },

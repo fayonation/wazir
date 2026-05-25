@@ -6,6 +6,7 @@ export const WorkerRegistrationSchema = z.object({
   platform: z.string().min(1),
   version: z.string().min(1),
   capabilities: z.array(z.string()).default([]),
+  worker_url: z.string().url(),
 });
 
 export type WorkerRegistration = z.infer<typeof WorkerRegistrationSchema>;
