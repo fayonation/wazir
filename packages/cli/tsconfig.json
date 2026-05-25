@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "composite": true,
+    "tsBuildInfoFile": "./dist/.tsbuildinfo"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../protocol" },
+    { "path": "../hub" },
+    { "path": "../worker" },
+    { "path": "../adapter-cli" },
+    { "path": "../adapter-telegram" }
+  ]
+}

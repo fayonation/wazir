@@ -1,0 +1,213 @@
+import express, { type Request, type Response } from "express";
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
+import type { Server } from "node:http";
+import {
+  ApprovalDecisionCallbackSchema,
+  type RiskPattern,
+} from "@wazir/protocol";
+import { createHmacMiddleware, rawBodyCapture, type RawBodyRequest } from "./hmacMiddleware.js";
+import { compilePatterns, classify, type CompiledPattern } from "./risk.js";
+import { HubClient } from "./hubClient.js";
+import {
+  ClaudeHookPayloadSchema,
+  buildAllowResponse,
+  buildDenyResponse,
+  buildModifyResponse,
+} from "./claudeHook.js";
+import { createLogger, type WorkerLogger } from "./logger.js";
+
+export interface WorkerStartOptions {
+  workerId: string;
+  bindHost: string;
+  bindPort: number;
+  hubUrl: string;
+  hmacSecret: string;
+  hostname?: string;
+  version: string;
+  riskPatterns: RiskPattern[];
+  logger?: WorkerLogger;
+  heartbeatIntervalMs?: number;
+  approvalTimeoutSeconds?: number;
+}
+
+export interface WorkerHandle {
+  port: number;
+  url: string;
+  stop: () => Promise<void>;
+}
+
+interface PendingDecision {
+  resolve: (value: { decision: "approve" | "reject" | "modify"; command: string; actor: string }) => void;
+  timer: NodeJS.Timeout;
+}
+
+export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandle> {
+  const logger = opts.logger ?? createLogger();
+  const compiledPatterns = compilePatterns(opts.riskPatterns);
+  const hubClient = new HubClient(opts.hubUrl, opts.hmacSecret);
+  const host = opts.hostname ?? hostname();
+  const approvalTimeoutSeconds = opts.approvalTimeoutSeconds ?? 540;
+  const pendingDecisions = new Map<string, PendingDecision>();
+
+  await hubClient.register({
+    worker_id: opts.workerId,
+    hostname: host,
+    platform: process.platform,
+    version: opts.version,
+    capabilities: ["claude-code-hook"],
+  });
+  logger.info({ hub_url: opts.hubUrl }, "registered with hub");
+
+  const heartbeatTimer = setInterval(() => {
+    hubClient.heartbeat(opts.workerId).catch((err) => {
+      logger.warn({ err }, "heartbeat failed");
+    });
+  }, opts.heartbeatIntervalMs ?? 30_000);
+  heartbeatTimer.unref();
+
+  const app = express();
+  app.use(
+    express.json({
+      limit: "1mb",
+      verify: (req, _res, buf) => rawBodyCapture(req as RawBodyRequest, _res as Response, buf),
+    }),
+  );
+
+  app.get("/v1/health", (_req, res) => {
+    res.json({ ok: true, worker_id: opts.workerId, pending: pendingDecisions.size });
+  });
+
+  // boundLocator returns the URL the worker is actually listening on; resolved after listen()
+  let boundLocator = () => `http://${opts.bindHost}:${opts.bindPort}`;
+
+  app.post("/v1/hooks/claude-code/pre-tool-use", async (req: RawBodyRequest, res: Response) => {
+    const parsed = ClaudeHookPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logger.warn({ details: parsed.error.flatten() }, "invalid claude hook payload");
+      res.status(200).json(buildAllowResponse("wazir: invalid hook payload, allowing by default"));
+      return;
+    }
+    const payload = parsed.data;
+    if (payload.tool_name !== "Bash") {
+      res.status(200).json(buildAllowResponse());
+      return;
+    }
+    const command = payload.tool_input.command;
+    const risk = classify(command, compiledPatterns);
+    if (!risk.risky) {
+      res.status(200).json(buildAllowResponse());
+      return;
+    }
+    const requestId = randomUUID();
+    const callbackUrl = `${boundLocator()}/v1/decisions/${requestId}`;
+    const decisionPromise = new Promise<{ decision: "approve" | "reject" | "modify"; command: string; actor: string }>(
+      (resolve) => {
+        const timer = setTimeout(() => {
+          pendingDecisions.delete(requestId);
+          resolve({ decision: "reject", command, actor: "system:worker_timeout" });
+        }, approvalTimeoutSeconds * 1000);
+        timer.unref();
+        pendingDecisions.set(requestId, { resolve, timer });
+      },
+    );
+
+    try {
+      await hubClient.submitApproval({
+        request_id: requestId,
+        source: "claude-code",
+        worker_id: opts.workerId,
+        session_id: payload.session_id,
+        command,
+        context: {
+          cwd: payload.cwd,
+          tool_name: payload.tool_name,
+          risk_class: risk.pattern?.label,
+        },
+        callback_url: callbackUrl,
+        timeout_seconds: approvalTimeoutSeconds,
+      });
+    } catch (err) {
+      const pending = pendingDecisions.get(requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingDecisions.delete(requestId);
+      }
+      logger.error({ err, request_id: requestId }, "hub submit failed; allowing by default");
+      res.status(200).json(buildAllowResponse("wazir: hub unreachable, allowing"));
+      return;
+    }
+
+    logger.info({ request_id: requestId, risk: risk.pattern?.label }, "approval requested");
+    const result = await decisionPromise;
+    logger.info({ request_id: requestId, decision: result.decision, actor: result.actor }, "approval resolved");
+
+    if (result.decision === "approve") {
+      res.status(200).json(buildAllowResponse(`wazir: approved by ${result.actor}`));
+      return;
+    }
+    if (result.decision === "reject") {
+      res.status(200).json(buildDenyResponse(`wazir: rejected by ${result.actor}`));
+      return;
+    }
+    res.status(200).json(buildModifyResponse(result.command, `wazir: modified by ${result.actor}`));
+  });
+
+  const hmac = createHmacMiddleware(opts.hmacSecret);
+
+  app.post("/v1/decisions/:request_id", hmac, (req: RawBodyRequest, res: Response) => {
+    const requestId = req.params.request_id;
+    if (!requestId) {
+      res.status(400).json({ error: "missing_request_id" });
+      return;
+    }
+    const parsed = ApprovalDecisionCallbackSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_body", details: parsed.error.flatten() });
+      return;
+    }
+    if (parsed.data.request_id !== requestId) {
+      res.status(400).json({ error: "request_id_mismatch" });
+      return;
+    }
+    const pending = pendingDecisions.get(requestId);
+    if (!pending) {
+      res.status(404).json({ error: "no_pending_request" });
+      return;
+    }
+    clearTimeout(pending.timer);
+    pendingDecisions.delete(requestId);
+    pending.resolve({
+      decision: parsed.data.decision,
+      command: parsed.data.command,
+      actor: parsed.data.actor,
+    });
+    res.json({ ok: true });
+  });
+
+  const server: Server = await new Promise((resolve) => {
+    const s = app.listen(opts.bindPort, opts.bindHost, () => resolve(s));
+  });
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : opts.bindPort;
+  const url = `http://${opts.bindHost}:${port}`;
+  boundLocator = () => url;
+  logger.info({ url, worker_id: opts.workerId, patterns: compiledPatterns.length }, "worker started");
+
+  return {
+    port,
+    url,
+    stop: async () => {
+      clearInterval(heartbeatTimer);
+      for (const p of pendingDecisions.values()) {
+        clearTimeout(p.timer);
+        p.resolve({ decision: "reject", command: "", actor: "system:shutdown" });
+      }
+      pendingDecisions.clear();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+      logger.info("worker stopped");
+    },
+  };
+}

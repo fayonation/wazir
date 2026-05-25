@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.tsbuildinfo
+*.tsbuildinfo
+.DS_Store
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+logs/
+
+# editor
+.vscode/
+.idea/
+
+# pnpm
+.pnpm-store/
+
+# wazir user data (should never be under repo)
+.wazir/
