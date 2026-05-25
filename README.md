@@ -6,7 +6,11 @@ A local-first supervisor for AI coding agents. Talk to your dev workflow from an
 
 ## Status
 
-**Phase 0 — Architecture.** No code yet. The current artifact is this documentation. If you are an AI agent picking up this work, start at [`AGENTS.md`](./AGENTS.md).
+**Phase 1 shipped.** Telegram approval bridge works end-to-end: risky bash commands from Claude Code route to your phone for Approve / Reject / Modify. Phase 1.5 polish — launchd auto-start, model-name surfacing in approvals, `wazir doctor` health check — is in.
+
+**Phase 2 in design.** Bidirectional voice over tmux-managed sessions: send Telegram voice notes that become prompts inside a Claude Code session, hear replies back as audio. Local-first by default (`whisper.cpp` + `piper`). See [`docs/02-roadmap.md`](./docs/02-roadmap.md) and [`docs/06-decisions.md`](./docs/06-decisions.md) (ADRs 011–014) for the locked design.
+
+If you are an AI agent picking up this work, start at [`AGENTS.md`](./AGENTS.md).
 
 ## Document map
 
@@ -34,7 +38,25 @@ The interface layer is pluggable. The architecture deliberately treats Telegram 
 
 ## Quickstart
 
-Nothing to run yet. Start at [`AGENTS.md`](./AGENTS.md) or [`docs/00-vision.md`](./docs/00-vision.md).
+Requires Node 20 (pinned in `.nvmrc`) and macOS or Linux. Native Windows is WSL2-only — see [`docs/06-decisions.md` ADR-006](./docs/06-decisions.md).
+
+```sh
+nvm use                # picks up .nvmrc → Node 20
+pnpm install
+pnpm wazir:init        # interactive: bot token, chat allowlist, HMAC secret
+pnpm dev               # hub + worker concurrently
+```
+
+Then merge the hook snippet `pnpm wazir:init` printed into `~/.claude/settings.json` (Wazir doesn't auto-edit it). Trigger a risky command in any Claude Code session (`git push`, `rm`, `sudo …`) — your phone gets a Telegram message with Approve / Reject / Modify buttons.
+
+For always-on (recommended once verified):
+
+```sh
+pnpm wazir:install-service   # LaunchAgents — auto-start on login, restart on crash
+pnpm wazir:doctor             # health checklist
+```
+
+Detailed setup, security, and architecture in `docs/`. Start at [`AGENTS.md`](./AGENTS.md) or [`docs/00-vision.md`](./docs/00-vision.md) for the why.
 
 ## License
 

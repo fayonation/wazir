@@ -4,7 +4,11 @@ If you are an AI agent (Claude Code, Cursor, Codex, etc.) picking up work on **W
 
 ## Project state
 
-**Phase 0 — Architecture only.** No source code exists yet. The current artifact is the documentation in `docs/`. The next milestone is **Phase 1: Telegram Approval Bridge MVP** (see `docs/03-mvp-scope.md`).
+**Phase 1 shipped + Phase 1.5 polish in.** Telegram approval bridge works end-to-end. macOS LaunchAgents auto-start hub + worker on login. `wazir doctor` validates the install.
+
+**Phase 2 design locked, implementation not started.** See [`docs/02-roadmap.md` Phase 2](./docs/02-roadmap.md) and ADRs 011–014 in [`docs/06-decisions.md`](./docs/06-decisions.md). The design is: every agent session runs in a Wazir-spawned tmux pane (ADR-011); local `whisper.cpp` + `piper` for STT/TTS, no required cloud (ADR-012/013/014).
+
+The next milestone is **Phase 2 implementation**, starting with the worker `tmux/` module.
 
 ## Read in this order
 
