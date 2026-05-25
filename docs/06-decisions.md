@@ -86,13 +86,15 @@ Each ADR captures a decision, why it was made, and what we considered. Format: s
 
 ## ADR-007 — Whisper API in Phase 2, not local whisper.cpp
 
-**Status:** Proposed (Phase 2 — not yet implemented)
+**Status:** Superseded by [ADR-013](#adr-013--local-whispercpp-as-default-stt-supersedes-adr-007). Original text kept below for history.
 
-**Decision:** When Phase 2 adds voice transcription, the default is OpenAI's Whisper API. Local `whisper.cpp` is an opt-in alternative (set `transcription.provider: local` in config).
+**Decision (superseded):** When Phase 2 adds voice transcription, the default is OpenAI's Whisper API. Local `whisper.cpp` is an opt-in alternative (set `transcription.provider: local` in config).
 
-**Why:** Local Whisper on an already-busy MacBook (running Claude Code, builds, etc.) competes for CPU/GPU. The API is fast, cheap (~$0.006 / minute), and the privacy tradeoff is acceptable since voice notes are short user commands, not corporate IP.
+**Why (superseded):** Local Whisper on an already-busy MacBook (running Claude Code, builds, etc.) competes for CPU/GPU. The API is fast, cheap (~$0.006 / minute), and the privacy tradeoff is acceptable since voice notes are short user commands, not corporate IP.
 
-**Consequences:** Phase 2 requires an OpenAI key (or another STT provider) by default. The local option keeps a privacy escape hatch.
+**Consequences (superseded):** Phase 2 requires an OpenAI key (or another STT provider) by default. The local option keeps a privacy escape hatch.
+
+**Why we changed our mind:** The Phase 2 design discussion locked in a stricter local-first stance ([ADR-012](#adr-012--local-first-principle-no-required-cloud-dependencies)). Requiring an OpenAI key by default contradicts that. See ADR-013 for the new default.
 
 ---
 
@@ -131,6 +133,106 @@ Each ADR captures a decision, why it was made, and what we considered. Format: s
 **Why:** pnpm workspaces are zero-config and fast. Nx/Turborepo's task-graph features are unnecessary for ~6 packages with linear dependencies. Separate repos add overhead for a tightly coupled set of packages.
 
 **Consequences:** We may revisit if Phase 6 introduces many independently-released agent adapters.
+
+---
+
+## ADR-011 — tmux is the canonical agent-session container
+
+**Status:** Accepted (Phase 2 design)
+
+**Decision:** Every agent session that Wazir supervises (Claude Code first, Codex/Aider/anything else later) runs inside a Wazir-managed tmux session named `wazir-<source>-<id>` (e.g. `wazir-claude-a1b2c3`). The worker spawns these sessions, tracks them, and is the only process that uses `tmux send-keys` and `tmux capture-pane` to inject input and read output.
+
+**Why:**
+- The research in Phase 2 (see PR for Phase 2 design) found no first-party API to inject prompts into a *running* Claude Code session. Anthropic's Remote Control is cloud-routed; the Agent SDK only spawns headless sessions; the `UserPromptSubmit` hook can append context but not replace the prompt. tmux + `send-keys` is the only mechanism that delivers voice notes as actual user prompts in the user's interactive session.
+- It makes the worker the source of truth for "what sessions exist." Telegram (Phase 2), web dashboard (Phase 4), AR glasses (Phase 7) all read/write through the same primitive — they never talk to Claude Code directly.
+- It generalises beyond Claude Code for free. `wazir-codex-...`, `wazir-aider-...`, `wazir-shell-...` are all the same shape. This deepens ADR-003.
+- The user owns the tmux. Wazir doesn't replace the tmux they use day-to-day; it manages its own. A normal terminal can still `tmux attach -t wazir-claude-a1b2c3` to look at what's happening.
+
+**Alternatives considered:**
+- **node-pty + in-process PTY.** Loses the ability to attach a human terminal to the same session — a critical debug affordance. Loses crash resilience (if Wazir dies the session dies).
+- **Anthropic Remote Control reverse-engineering.** Cloud-routed and undocumented; would lock us to Anthropic.
+- **Per-IDE plugins (VS Code extension API).** Not local-first, surface is undocumented, would have to be re-done for every IDE.
+
+**Consequences:**
+- The worker gains a `tmux/` module: `spawnSession`, `listSessions`, `sendInput`, `capturePane`, `killSession`.
+- New CLI: `wazir session new <agent>` / `wazir session list` / `wazir session attach <id>` / `wazir session kill <id>`.
+- Workers without tmux installed (Windows-native, not WSL) cannot run Phase 2+ features. Documented as a known constraint; WSL2 covers the gap.
+- The "active session" concept moves into the hub (so the Telegram adapter knows which session a voice note targets).
+- Footguns: programmatic input to an Ink-based TUI can race with concurrent human typing. Mitigation: when Wazir is delivering a transcribed prompt, briefly lock the pane (a small banner / debounce window) before `send-keys` and unlock on the next render tick. Document the constraint that hand-typing while Telegram is mid-delivery may interleave.
+
+---
+
+## ADR-012 — Local-first principle (no required cloud dependencies)
+
+**Status:** Accepted (Phase 2 design — formalizes a previously implicit principle)
+
+**Decision:** Wazir's core supervisor functionality MUST work with no network connection beyond Telegram's bot API (which is the user's chosen surface, not a vendor lock-in). Every feature that *could* be implemented with a cloud API MUST also have a working local implementation, and the local one MUST be the default. Cloud providers are always opt-in via explicit config.
+
+**Why:**
+- The user has stated they want Wazir to be "as independent from outside services as possible, self-sufficient, install the app on any machine and it runs." Hard-coding cloud defaults erodes that.
+- The end-state (Phase 7 AR + voice) is most useful exactly when the user is offline / off-network — walking, gym, transit. Phase 2 design choices that assume connectivity rule out the Phase 7 use case retroactively.
+- A working local default lowers the activation cost for new users — no API keys, no billing, no signup. The MVP for any new install is "one binary, one config file, it works."
+- It removes a class of failure mode (vendor outages, billing lapses, API deprecations) from anything that matters for safety (approvals) or daily use (voice).
+
+**Alternatives considered:**
+- **Cloud-first with local fallback (the prior position in [ADR-007](#adr-007--whisper-api-in-phase-2-not-local-whispercpp)).** Cheap to ship, but path-dependent: once defaults are cloud, "opt-in local" rots because no one tests it. Rejected.
+- **Cloud-only.** Lower engineering cost, ruled out by the user's explicit preference.
+
+**Consequences:**
+- Default STT is `whisper.cpp` (see [ADR-013](#adr-013--local-whispercpp-as-default-stt-supersedes-adr-007)).
+- Default TTS is `piper` (see [ADR-014](#adr-014--piper-as-default-tts)).
+- Future capabilities (image OCR, embeddings, search, etc.) follow the same rule: ship the local path first, expose an API option behind a config switch.
+- Adds a non-trivial install footprint (`whisper.cpp` models are ~150 MB, Piper voices are ~30 MB). Acceptable.
+- `wazir doctor` should verify that each enabled-local feature has its model/binary present, with a clear "run `wazir install-models`" remediation when missing.
+
+---
+
+## ADR-013 — Local `whisper.cpp` as default STT (supersedes ADR-007)
+
+**Status:** Accepted (Phase 2 design)
+
+**Decision:** Wazir's default speech-to-text provider is local `whisper.cpp` with the small or base English model bundled (or downloaded on first run). The OpenAI Whisper API remains available as an opt-in via `transcription.provider: openai` in config, primarily for users on extremely low-power machines (Raspberry Pi hub deployments).
+
+**Why:**
+- Required by [ADR-012](#adr-012--local-first-principle-no-required-cloud-dependencies).
+- Modern Macs (M1+) transcribe a 10-second voice note in well under a second on the `base.en` model. Latency budget for "voice note arrives → prompt typed into tmux" is fine.
+- Privacy: voice notes can contain sensitive product / personal context. Keeping audio on-device removes the data-leakage failure mode entirely.
+
+**Alternatives considered:**
+- **OpenAI Whisper API as default (original ADR-007).** Cheaper to integrate, less to install. Rejected per ADR-012.
+- **`whisper.cpp` with the `tiny` model (faster, less accurate).** Considered as the default, but `base.en` is the right tradeoff for short command-style voice notes.
+- **Faster-Whisper / WhisperX / Distil-Whisper.** Better accuracy or speed, but heavier dependencies (Python, CUDA on some). `whisper.cpp` is a single C++ binary with no runtime — wins for the "ships on any laptop" requirement.
+
+**Consequences:**
+- Worker gains a `transcription/` module that shells out to `whisper.cpp` (downloaded/built on first install).
+- `wazir doctor` checks for the whisper binary and the model file; `wazir install-models` fetches them.
+- Bundle increases by ~150 MB after first run (model weights). Acceptable.
+- If the user opts into the OpenAI provider, the key lives in keychain (same pattern as Telegram).
+
+---
+
+## ADR-014 — Piper as default TTS
+
+**Status:** Accepted (Phase 2 design)
+
+**Decision:** Wazir's default text-to-speech provider for replying to the user via Telegram audio is `piper` running locally. The user has explicitly accepted a robotic voice for MVP; quality upgrades are a Phase 7 polish item, not a blocker.
+
+**Why:**
+- Required by [ADR-012](#adr-012--local-first-principle-no-required-cloud-dependencies).
+- The user has prior production experience with Piper in a similar project ("openclaw") and it shipped successfully.
+- Piper is one C++ binary plus a small `.onnx` voice model (~30 MB). It runs in real-time on commodity hardware (sub-100ms per sentence on M1). No GPU, no runtime.
+- Latency is critical for the Phase 7 (AR voice) use case. Cloud TTS (ElevenLabs, OpenAI) adds 300–800ms of round-trip even with streaming, plus per-character billing. Local Piper sidesteps both.
+
+**Alternatives considered:**
+- **macOS native `say` command + AVSpeechSynthesizer.** OS-locked, breaks ADR-012 (the hub may run on a Pi or Linux VPS in Phase 5).
+- **ElevenLabs / OpenAI TTS API.** Higher quality, but external dependency + cost + latency. Available as opt-in `voice_reply.provider: elevenlabs`.
+- **Mimic 3 / Coqui XTTS.** Higher quality than Piper, much heavier (Python runtime, GPU helps). Reconsider in Phase 7 when latency vs. quality tradeoffs are revisited for AR.
+
+**Consequences:**
+- Worker gains a `tts/` module that pipes text → Piper → ogg/opus → Telegram audio.
+- TTS is opt-in per-session by default: text replies are sent as Telegram text messages, voice replies are sent only when the user requests them (a `/voice` command or persistent toggle per-chat). This minimises noise without giving up the capability.
+- If the user sends a voice note, the reply is voice by default (mirror the input modality).
+- `wazir install-models` also installs the Piper voice on first run.
 
 ---
 
