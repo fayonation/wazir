@@ -731,7 +731,10 @@ export class TelegramAdapter implements InterfaceAdapter {
         }
       };
 
-      // 3. Drive the session.
+      // 3. Drive the session. Snapshot JSONL state BEFORE sending so we can
+      // detect the new assistant turn by diffing message_count and
+      // last_assistant against this baseline.
+      const beforeMeta = await sessions.getDiscoveredSession(sessionId).catch(() => null);
       try {
         await sessions.sendInput(sessionId, text);
       } catch (err) {
@@ -754,19 +757,34 @@ export class TelegramAdapter implements InterfaceAdapter {
       typingTimer.unref?.();
 
       try {
-        const paneText = await this.waitForStablePane(sessions, sessionId);
-        const meta = await sessions.getDiscoveredSession(sessionId).catch(() => null);
-        const responseText = meta?.last_assistant?.trim();
-        const body = responseText ?? cleanPaneText(paneText);
+        // Primary signal: wait for a new assistant turn in the JSONL.
+        // This is authoritative — JSONL is only written when Claude
+        // completes a turn — so it sidesteps all the timing pitfalls of
+        // polling the visible pane (status-bar gaps, input echo,
+        // streaming pauses, etc.).
+        const response = await this.waitForAssistantResponse(sessions, sessionId, beforeMeta);
         deleteWorking();
-        if (body) {
-          await this.deliverResponse(ctx, sessions, chatId, body);
+        if (response) {
+          await this.deliverResponse(ctx, sessions, chatId, response);
         } else {
-          await ctx.reply("(Claude is ready — send a message to get a response)");
+          // Fall back to pane scraping if JSONL never recorded a new
+          // assistant message (e.g. session not yet in discovery, or
+          // Claude is blocked on an approval).
+          try {
+            const cap = await sessions.capturePane(sessionId, { visibleOnly: true });
+            const cleaned = cleanPaneText(cap.text);
+            if (cleaned) {
+              await this.deliverResponse(ctx, sessions, chatId, cleaned);
+            } else {
+              await ctx.reply("(no response detected within timeout — Claude may be blocked on a tool approval, or the session is idle)");
+            }
+          } catch (err) {
+            await ctx.reply(`(could not capture response: ${(err as Error).message})`);
+          }
         }
       } catch (err) {
         deleteWorking();
-        await ctx.reply(`(could not capture response: ${(err as Error).message})`);
+        await ctx.reply(`(delivery failed: ${(err as Error).message})`);
       } finally {
         clearInterval(typingTimer);
       }
@@ -873,6 +891,65 @@ export class TelegramAdapter implements InterfaceAdapter {
     // Claude's response is delivered separately and goes through the normal
     // voice mode check (text, voice note, or auto depending on /voice setting).
     await this.deliverPromptAndStream(ctx, sessions, state.active_session_id, text.trim());
+  }
+
+  /**
+   * Wait for a new assistant turn to appear in the session's JSONL
+   * transcript. This is the authoritative completion signal:
+   *
+   *   - Claude Code only appends JSONL lines when a turn is actually
+   *     written (no half-written state).
+   *   - The file's mtime updates on every line, so "mtime quiet for
+   *     QUIET_MS" is a reliable "this turn is fully done" signal.
+   *
+   * Done = ALL of:
+   *   - message_count strictly greater than before
+   *   - last_assistant text differs from before (real text response,
+   *     not a tool-only turn)
+   *   - last_activity_at hasn't advanced for QUIET_MS (no more writes)
+   *
+   * Returns the new last_assistant text, or null on timeout.
+   */
+  private async waitForAssistantResponse(
+    sessions: SessionService,
+    sessionId: string,
+    before: DiscoveredSession | null,
+  ): Promise<string | null> {
+    const start = Date.now();
+    const QUIET_MS = 2000;
+    const beforeCount = before?.message_count ?? 0;
+    const beforeAssistant = before?.last_assistant ?? null;
+
+    let lastSeenMtime = before?.last_activity_at ?? 0;
+    let lastMtimeChangeAt = Date.now();
+
+    while (Date.now() - start < this.maxWaitMs) {
+      await new Promise((r) => setTimeout(r, this.pollIntervalMs));
+      let meta: DiscoveredSession | null;
+      try {
+        meta = await sessions.getDiscoveredSession(sessionId);
+      } catch (err) {
+        this.logger.warn({ err, sessionId }, "JSONL poll failed");
+        continue;
+      }
+      if (!meta) continue;
+
+      if (meta.last_activity_at !== lastSeenMtime) {
+        lastSeenMtime = meta.last_activity_at;
+        lastMtimeChangeAt = Date.now();
+      }
+      const hasNewTurn = meta.message_count > beforeCount;
+      const hasNewAssistant =
+        meta.last_assistant !== undefined &&
+        meta.last_assistant.trim().length > 0 &&
+        meta.last_assistant !== beforeAssistant;
+      const isQuiet = Date.now() - lastMtimeChangeAt >= QUIET_MS;
+
+      if (hasNewTurn && hasNewAssistant && isQuiet) {
+        return meta.last_assistant ?? null;
+      }
+    }
+    return null;
   }
 
   /**
