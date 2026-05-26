@@ -21,7 +21,6 @@
     "@wazir/protocol": "workspace:*",
     "@wazir/worker": "workspace:*",
     "commander": "^12.1.0",
-    "keytar": "^7.9.0",
     "prompts": "^2.4.2",
     "telegraf": "^4.16.3",
     "yaml": "^2.6.1",

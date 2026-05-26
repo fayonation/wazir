@@ -56,3 +56,28 @@ export const SessionReportSchema = z.object({
 });
 
 export type SessionReport = z.infer<typeof SessionReportSchema>;
+
+/**
+ * A session found on disk by enumerating an agent's persisted state.
+ * For Claude Code this is `~/.claude/projects/<encoded-cwd>/<id>.jsonl`.
+ * These represent conversations that can be RESUMED — they may or may
+ * not currently be tracked by a tmux pane.
+ */
+export const DiscoveredSessionSchema = z.object({
+  session_id: z.string(),
+  agent: z.string().min(1),
+  cwd: z.string().min(1),
+  first_message: z.string().optional(),
+  last_assistant: z.string().optional(),
+  message_count: z.number().int().nonnegative(),
+  last_activity_at: z.number().int().positive(),
+  model: z.string().optional(),
+  /** User-given name from Wazir's `/rename`. Survives across spawn/kill. */
+  label: z.string().optional(),
+  /** User-given title from Claude Code's own `/rename` (custom-title in JSONL). */
+  agent_title: z.string().optional(),
+  /** Claude Code's auto-generated title (ai-title in JSONL). */
+  ai_title: z.string().optional(),
+});
+
+export type DiscoveredSession = z.infer<typeof DiscoveredSessionSchema>;

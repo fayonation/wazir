@@ -1,49 +1,14 @@
 import { readFileSync, existsSync } from "node:fs";
-import { KEYCHAIN_SERVICE, ENV_FILE_PATH } from "./paths.js";
+import { ENV_FILE_PATH } from "./paths.js";
 
-interface KeytarApi {
-  setPassword(service: string, account: string, password: string): Promise<void>;
-  getPassword(service: string, account: string): Promise<string | null>;
-  deletePassword(service: string, account: string): Promise<boolean>;
-  findCredentials(service: string): Promise<Array<{ account: string; password: string }>>;
-}
-
-let keytarPromise: Promise<KeytarApi | null> | null = null;
-
-async function loadKeytar(): Promise<KeytarApi | null> {
-  if (keytarPromise) return keytarPromise;
-  keytarPromise = (async () => {
-    try {
-      const mod = (await import("keytar")) as unknown as KeytarApi & { default?: KeytarApi };
-      const api: KeytarApi = mod.default ?? mod;
-      // touch the native binding to fail fast if missing
-      await api.findCredentials(KEYCHAIN_SERVICE);
-      return api;
-    } catch {
-      return null;
-    }
-  })();
-  return keytarPromise;
-}
-
-export async function setKeychain(account: string, value: string): Promise<boolean> {
-  const k = await loadKeytar();
-  if (!k) return false;
-  await k.setPassword(KEYCHAIN_SERVICE, account, value);
-  return true;
-}
-
-export async function getKeychain(account: string): Promise<string | null> {
-  const k = await loadKeytar();
-  if (!k) return null;
-  return k.getPassword(KEYCHAIN_SERVICE, account);
-}
-
-export async function deleteKeychain(account: string): Promise<boolean> {
-  const k = await loadKeytar();
-  if (!k) return false;
-  return k.deletePassword(KEYCHAIN_SERVICE, account);
-}
+/**
+ * Wazir stores all secrets in `~/.wazir/.env`. We deliberately do not use the
+ * macOS keychain or any other OS-specific secret store — see ADR-015. This
+ * keeps the install self-contained and portable: copy `~/.wazir/` to any
+ * machine and the daemons come up.
+ *
+ * The .env file is created with mode 0600 by `wazir init` and stays that way.
+ */
 
 export function loadDotEnv(path = ENV_FILE_PATH): Record<string, string> {
   if (!existsSync(path)) return {};
@@ -75,22 +40,10 @@ export function mergeDotEnv(env: Record<string, string>): void {
   }
 }
 
-export async function resolveTelegramToken(
-  envVarName: string,
-  useKeychain: boolean,
-  keychainAccount: string,
-): Promise<string | null> {
-  if (useKeychain) {
-    const fromKc = await getKeychain(keychainAccount);
-    if (fromKc) return fromKc;
-  }
-  const fromEnv = process.env[envVarName];
-  return fromEnv ?? null;
+export function resolveTelegramToken(envVarName: string): string | null {
+  return process.env[envVarName] ?? null;
 }
 
-export async function resolveHmacSecret(envVarName = "WAZIR_HMAC_SECRET"): Promise<string | null> {
-  const fromKc = await getKeychain("hmac-secret");
-  if (fromKc) return fromKc;
-  const fromEnv = process.env[envVarName];
-  return fromEnv ?? null;
+export function resolveHmacSecret(envVarName = "WAZIR_HMAC_SECRET"): string | null {
+  return process.env[envVarName] ?? null;
 }

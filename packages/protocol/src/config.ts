@@ -10,7 +10,6 @@ export type RiskPattern = z.infer<typeof RiskPatternSchema>;
 
 export const TelegramAdapterConfigSchema = z.object({
   token_env: z.string().default("WAZIR_TELEGRAM_TOKEN"),
-  token_keychain_account: z.string().optional(),
   allowlist: z.array(z.number().int()).default([]),
   use_inline_buttons: z.boolean().default(true),
   max_command_chars: z.number().int().positive().default(1200),

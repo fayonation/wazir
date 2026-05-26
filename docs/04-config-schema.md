@@ -72,12 +72,9 @@ logging:
 
 ## Secrets
 
-Secrets never live in `config.yaml`. Two supported sources:
+Secrets never live in `config.yaml`. They live in `~/.wazir/.env` with file permissions `0600`. `config.yaml` references the env var name (e.g. `token_env: WAZIR_TELEGRAM_TOKEN`); the daemons load `.env` at startup and resolve the name.
 
-1. **Environment variables** referenced by name in config (e.g. `token_env: WAZIR_TELEGRAM_TOKEN`). Load from a `.env` file at startup, or set in your shell profile.
-2. **OS keychain** via `keytar` (macOS Keychain, Windows Credential Manager, libsecret on Linux). `wazir init` offers this as the default.
-
-Recommended: keychain for development, env vars for CI / shared deployments.
+We deliberately do **not** use the macOS Keychain (or any OS-specific secret store) — see [`06-decisions.md` ADR-015](./06-decisions.md#adr-015--secrets-live-in-wazirenv-not-the-os-keychain) for the rationale. Single `.env` file = portable install (copy `~/.wazir/` to a new machine and the daemons come up).
 
 ## `wazir init` flow
 
@@ -96,10 +93,7 @@ Wazir init wizard. This will create ~/.wazir/config.yaml.
     follow the prompts, paste the token here.
   Token: ********************************
 
-? How should I store this token?
-  ❯ macOS Keychain (recommended)
-    Environment variable (.env file in ~/.wazir/)
-    Skip — I'll set $WAZIR_TELEGRAM_TOKEN myself
+(Token is written to ~/.wazir/.env with mode 0600.)
 
 ? Now I'll send a message from your bot. Open Telegram, find
   @YourBotName, send any message, then press Enter here.

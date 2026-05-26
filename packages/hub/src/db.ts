@@ -130,6 +130,14 @@ function migrate(db: DB): void {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (adapter, chat_key)
     );
+
+    -- User-given names for sessions. Survives kill/respawn; works for both
+    -- tracked (in-tmux) and discovered (on-disk-only) sessions.
+    CREATE TABLE IF NOT EXISTS session_labels (
+      session_id TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
   `);
 
   // Best-effort additive migration for pre-existing 'workers' tables that

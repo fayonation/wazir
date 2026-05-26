@@ -211,6 +211,32 @@ Each ADR captures a decision, why it was made, and what we considered. Format: s
 
 ---
 
+## ADR-015 — Secrets live in `~/.wazir/.env`, not the OS keychain
+
+**Status:** Accepted (Phase 2 polish — supersedes the keychain default established by [ADR-012](#adr-012--local-first-principle-no-required-cloud-dependencies)'s original implementation)
+
+**Decision:** All Wazir secrets (HMAC, Telegram bot token, future API keys for opt-in cloud TTS/STT providers) live in `~/.wazir/.env` with file permissions `0600`. We do not use macOS Keychain, Windows Credential Manager, or libsecret. The `keytar` dependency is removed from the project.
+
+**Why:**
+- Aligns with [ADR-012](#adr-012--local-first-principle-no-required-cloud-dependencies)'s "install on any machine and it runs" promise. With keychain, moving a working install to a new laptop required re-running the init wizard. With a single `.env` file, `cp -r ~/.wazir/ user@new-laptop:` is enough.
+- Avoids OS-specific dependencies and native compilation (keytar has prebuilds but still ships a `.node` binary per Node version).
+- Removes a class of user-confusing prompts: macOS asks the user to authorize each new process that wants to read a keychain item, even for the same user. Wazir's worker and the `security` CLI run as different binaries and got prompts independently, which broke trust in the system.
+- Single-file backups, single-file restores, single-file rotation.
+
+**Alternatives considered:**
+- **macOS Keychain (`keytar`) — original choice.** Slightly tighter security: secrets sit in a per-app store with OS-mediated access. Rejected because the portability/UX tradeoff isn't worth it for a single-user local tool. The threat model in [`05-security.md`](./05-security.md) doesn't defend against the user being compromised on their own workstation, so keychain's marginal benefit is moot.
+- **Encrypted file using a master password.** Adds an interactive unlock step on every daemon start; breaks LaunchAgent auto-start. Out of scope.
+- **No persistence — re-prompt on every start.** Unworkable for LaunchAgent daemons that come up on login.
+
+**Consequences:**
+- `~/.wazir/.env` is the single source of secrets. Mode `0600` enforced by `wazir init`.
+- The init wizard no longer presents a "where should I store this token?" choice — it just writes to `.env`.
+- Existing installs migrate via `scripts/migrate-keychain-to-env.mjs` (one-shot): move from keychain → `.env`, then delete the keychain entry.
+- `keytar` removed from `packages/cli/package.json` and from `secrets.ts`.
+- Docs updated: [`04-config-schema.md`](./04-config-schema.md) and [`05-security.md`](./05-security.md) no longer mention keychain.
+
+---
+
 ## ADR-014 — Piper as default TTS
 
 **Status:** Accepted (Phase 2 design)

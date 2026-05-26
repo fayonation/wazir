@@ -9,10 +9,7 @@ import {
   HOOK_SNIPPET_PATH,
   DEFAULT_DB_PATH,
   ENV_FILE_PATH,
-  KEYCHAIN_HMAC_ACCOUNT,
-  KEYCHAIN_TELEGRAM_ACCOUNT,
 } from "../paths.js";
-import { setKeychain, getKeychain } from "../secrets.js";
 import { defaultConfig, writeConfig } from "../config.js";
 
 interface InitAnswers {
@@ -20,7 +17,6 @@ interface InitAnswers {
   hubPort: number;
   workerPort: number;
   telegramToken: string;
-  tokenStorage: "keychain" | "env";
   allowlist: number[];
 }
 
@@ -81,40 +77,14 @@ export async function runInit(opts: { force?: boolean } = {}): Promise<void> {
   }
 
   const telegramToken = (answers.telegramToken ?? "").trim();
-  let tokenStorage: "keychain" | "env" | "skip" = "skip";
   let allowlist: number[] = [];
 
   if (telegramToken) {
     if (!TOKEN_SHAPE.test(telegramToken)) {
       console.warn("warning: token does not match the Telegram token shape; storing anyway.");
     }
-    const choice = await prompts(
-      {
-        type: "select",
-        name: "storage",
-        message: "How should I store this token?",
-        choices: [
-          { title: "OS keychain (recommended)", value: "keychain" },
-          { title: "Environment variable (.env file in ~/.wazir/)", value: "env" },
-          { title: "Skip — I'll set $WAZIR_TELEGRAM_TOKEN myself", value: "skip" },
-        ],
-        initial: 0,
-      },
-      { onCancel: () => process.exit(1) },
-    );
-    tokenStorage = (choice.storage as "keychain" | "env" | "skip") ?? "skip";
-
-    if (tokenStorage === "keychain") {
-      const ok = await setKeychain(KEYCHAIN_TELEGRAM_ACCOUNT, telegramToken);
-      if (!ok) {
-        console.warn("keychain unavailable; falling back to .env file.");
-        tokenStorage = "env";
-      }
-    }
-    if (tokenStorage === "env") {
-      writeEnvVar(ENV_FILE_PATH, "WAZIR_TELEGRAM_TOKEN", telegramToken);
-      console.log(`wrote WAZIR_TELEGRAM_TOKEN to ${ENV_FILE_PATH}`);
-    }
+    writeEnvVar(ENV_FILE_PATH, "WAZIR_TELEGRAM_TOKEN", telegramToken);
+    console.log(`wrote WAZIR_TELEGRAM_TOKEN to ${ENV_FILE_PATH}`);
 
     allowlist = await captureAllowlist(telegramToken);
   } else {
@@ -122,13 +92,8 @@ export async function runInit(opts: { force?: boolean } = {}): Promise<void> {
   }
 
   const hmacSecret = generateHmacSecret();
-  const hmacOk = await setKeychain(KEYCHAIN_HMAC_ACCOUNT, hmacSecret);
-  if (!hmacOk) {
-    writeEnvVar(ENV_FILE_PATH, "WAZIR_HMAC_SECRET", hmacSecret);
-    console.log(`keychain unavailable; wrote WAZIR_HMAC_SECRET to ${ENV_FILE_PATH}`);
-  } else {
-    console.log("HMAC secret stored in OS keychain.");
-  }
+  writeEnvVar(ENV_FILE_PATH, "WAZIR_HMAC_SECRET", hmacSecret);
+  console.log(`wrote WAZIR_HMAC_SECRET to ${ENV_FILE_PATH}`);
 
   const config = defaultConfig({
     workerId: answers.workerId,
@@ -136,8 +101,6 @@ export async function runInit(opts: { force?: boolean } = {}): Promise<void> {
     workerPort: answers.workerPort,
     dbPath: DEFAULT_DB_PATH,
     allowlist,
-    telegramKeychainAccount:
-      tokenStorage === "keychain" ? KEYCHAIN_TELEGRAM_ACCOUNT : undefined,
   });
   writeConfig(config, CONFIG_PATH);
   console.log(`wrote ${CONFIG_PATH}`);
@@ -249,10 +212,3 @@ function writeEnvVar(path: string, key: string, value: string): void {
   }
 }
 
-export async function ensureHmacSecret(): Promise<string> {
-  const existing = await getKeychain(KEYCHAIN_HMAC_ACCOUNT);
-  if (existing) return existing;
-  const next = generateHmacSecret();
-  await setKeychain(KEYCHAIN_HMAC_ACCOUNT, next);
-  return next;
-}

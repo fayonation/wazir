@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { loadConfig } from "../config.js";
 import { resolveHmacSecret, resolveTelegramToken, loadDotEnv, mergeDotEnv } from "../secrets.js";
-import { CONFIG_PATH, KEYCHAIN_TELEGRAM_ACCOUNT } from "../paths.js";
+import { CONFIG_PATH } from "../paths.js";
 import { HMAC_HEADER_SIGNATURE, HMAC_HEADER_TIMESTAMP, signPayload } from "@wazir/protocol";
 
 interface Check {
@@ -55,11 +55,7 @@ export async function runDoctor(): Promise<void> {
 
   const telegramAdapter = cfg.adapters.find((a) => a.name === "telegram" && a.enabled);
   if (telegramAdapter && telegramAdapter.name === "telegram") {
-    const token = await resolveTelegramToken(
-      telegramAdapter.config.token_env,
-      Boolean(telegramAdapter.config.token_keychain_account),
-      telegramAdapter.config.token_keychain_account ?? KEYCHAIN_TELEGRAM_ACCOUNT,
-    );
+    const token = resolveTelegramToken(telegramAdapter.config.token_env);
     if (!token) {
       checks.push({ name: "telegram token", pass: false, detail: "token not found in keychain or env" });
     } else {

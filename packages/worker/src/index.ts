@@ -4,3 +4,4 @@ export { classify, type RiskClassification, compilePatterns } from "./risk.js";
 export { readModelFromTranscript, extractLatestModel, prettyModel } from "./transcript.js";
 export { TmuxManager, TmuxError } from "./tmux/index.js";
 export type { SpawnOptions as TmuxSpawnOptions, CaptureResult as TmuxCaptureResult } from "./tmux/index.js";
+export { discoverClaudeSessions, findClaudeSession } from "./discovery/claude.js";

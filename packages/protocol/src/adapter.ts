@@ -1,6 +1,6 @@
 import type { HubNotification } from "./notification.js";
 import type { UserDecision } from "./approval.js";
-import type { Session, SessionCapture } from "./session.js";
+import type { Session, SessionCapture, DiscoveredSession } from "./session.js";
 
 export type DecisionHandler = (approvalId: string, decision: UserDecision) => Promise<void>;
 
@@ -62,4 +62,28 @@ export interface SessionService {
     chatKey: string,
     patch: Partial<Pick<ChatState, "active_session_id" | "sticky_cwd" | "voice_mode">>,
   ): Promise<ChatState>;
+
+  /**
+   * Enumerate persisted agent sessions on disk that aren't currently in a
+   * tmux pane. These can be resumed via `resumeDiscoveredSession`.
+   * Phase 2 only supports Claude Code discovery (~/.claude/projects).
+   */
+  listDiscoveredSessions(): Promise<DiscoveredSession[]>;
+
+  /** Look up the metadata for one discovered session by id. */
+  getDiscoveredSession(sessionId: string): Promise<DiscoveredSession | null>;
+
+  /**
+   * Spawn a tmux pane that resumes the given on-disk session (runs
+   * `claude --resume <session_id>` in its original cwd). Returns the
+   * new tracked Session.
+   */
+  resumeDiscoveredSession(sessionId: string): Promise<Session>;
+
+  /**
+   * Set or clear the user-given name for a session. Works for both
+   * tracked and discovered sessions; the label persists across kill/respawn.
+   * Pass an empty/whitespace string to clear.
+   */
+  setSessionLabel(sessionId: string, label: string): Promise<void>;
 }

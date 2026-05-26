@@ -20,6 +20,7 @@ import {
 import { createLogger, type WorkerLogger } from "./logger.js";
 import { readModelFromTranscript, prettyModel } from "./transcript.js";
 import { TmuxManager } from "./tmux/index.js";
+import { discoverClaudeSessions, findClaudeSession } from "./discovery/claude.js";
 
 export interface WorkerStartOptions {
   workerId: string;
@@ -258,6 +259,26 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
     } catch (err) {
       res.status(500).json({ error: "kill_failed", detail: (err as Error).message });
     }
+  });
+
+  app.get("/v1/sessions/discovered", hmac, (_req: RawBodyRequest, res: Response) => {
+    try {
+      const list = discoverClaudeSessions();
+      res.json({ sessions: list });
+    } catch (err) {
+      res.status(500).json({ error: "discovery_failed", detail: (err as Error).message });
+    }
+  });
+
+  app.get("/v1/sessions/discovered/:session_id", hmac, (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const found = findClaudeSession(sessionId);
+    if (!found) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    res.json(found);
   });
 
   app.post("/v1/decisions/:request_id", hmac, (req: RawBodyRequest, res: Response) => {

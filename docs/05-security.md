@@ -42,12 +42,9 @@ This prevents another process on the same machine from POSTing forged approval d
 
 ### Token storage (Phase 1)
 
-Telegram bot tokens live in either:
+Telegram bot tokens, the HMAC secret, and any future provider keys live in `~/.wazir/.env` with mode `0600`. See [ADR-015](./06-decisions.md#adr-015--secrets-live-in-wazirenv-not-the-os-keychain) for why we chose plain `.env` over the OS keychain.
 
-1. The OS keychain via `keytar` (default), or
-2. An environment variable explicitly set by the user.
-
-Never in `config.yaml`. Never logged. `wazir status` and other diagnostics redact any string that matches `^\d{8,}:[A-Za-z0-9_-]{30,}` (Telegram token shape).
+Never in `config.yaml`. Never logged. `wazir status` and other diagnostics redact any string that matches `^\d{8,}:[A-Za-z0-9_-]{30,}` (Telegram token shape). The `.env` file is also listed in `.gitignore` so it can't accidentally be committed even if the user inadvertently puts a Wazir directory inside a tracked repo.
 
 ### Approval auth (Phase 1)
 

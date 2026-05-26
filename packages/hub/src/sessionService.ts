@@ -4,12 +4,15 @@ import {
   signPayload,
   SessionSchema,
   SessionCaptureSchema,
+  DiscoveredSessionSchema,
   type ChatState,
+  type DiscoveredSession,
   type Session,
   type SessionCapture,
   type SessionService,
 } from "@wazir/protocol";
-import type { SessionStore, WorkerStore, ChatStateStore } from "./store.js";
+import { z } from "zod";
+import type { SessionStore, WorkerStore, ChatStateStore, SessionLabelStore } from "./store.js";
 import type { HubLogger } from "./logger.js";
 
 export class HubSessionService implements SessionService {
@@ -17,13 +20,21 @@ export class HubSessionService implements SessionService {
     private readonly sessions: SessionStore,
     private readonly workers: WorkerStore,
     private readonly chatState: ChatStateStore,
+    private readonly labels: SessionLabelStore,
     private readonly hmacSecret: string,
     private readonly logger: HubLogger,
   ) {}
 
   async listSessions(opts: { workerId?: string; cwd?: string } = {}): Promise<Session[]> {
     const rows = this.sessions.list(opts);
-    return rows.map(rowToSession);
+    const ids = rows.map((r) => r.session_id);
+    const labels = this.labels.getMany(ids);
+    return rows.map((row) => {
+      const session = rowToSession(row);
+      const userLabel = labels.get(row.session_id);
+      if (userLabel) session.label = userLabel;
+      return session;
+    });
   }
 
   async spawnSession(req: {
@@ -132,6 +143,73 @@ export class HubSessionService implements SessionService {
       sticky_cwd: row.sticky_cwd,
       voice_mode: row.voice_mode,
     };
+  }
+
+  async listDiscoveredSessions(): Promise<DiscoveredSession[]> {
+    const worker = this.workers.listWorkers()[0];
+    if (!worker || !worker.worker_url) return [];
+    try {
+      const res = await this.callWorker(worker.worker_url, "GET", "/v1/sessions/discovered");
+      if (res.status !== 200) {
+        this.logger.warn({ status: res.status }, "discovered listing failed");
+        return [];
+      }
+      const parsed = z.object({ sessions: z.array(DiscoveredSessionSchema) }).safeParse(res.body);
+      if (!parsed.success) {
+        this.logger.warn({ issues: parsed.error.issues }, "discovered listing returned invalid shape");
+        return [];
+      }
+      const sessionsArr = parsed.data.sessions;
+      // Layer in user-given labels.
+      const ids = sessionsArr.map((s) => s.session_id);
+      const labelMap = this.labels.getMany(ids);
+      return sessionsArr.map((s) => {
+        const userLabel = labelMap.get(s.session_id);
+        return userLabel ? { ...s, label: userLabel } : s;
+      });
+    } catch (err) {
+      this.logger.warn({ err }, "discovered listing fetch failed");
+      return [];
+    }
+  }
+
+  async getDiscoveredSession(sessionId: string): Promise<DiscoveredSession | null> {
+    const worker = this.workers.listWorkers()[0];
+    if (!worker || !worker.worker_url) return null;
+    try {
+      const res = await this.callWorker(
+        worker.worker_url,
+        "GET",
+        `/v1/sessions/discovered/${encodeURIComponent(sessionId)}`,
+      );
+      if (res.status === 404) return null;
+      if (res.status !== 200) return null;
+      const parsed = DiscoveredSessionSchema.safeParse(res.body);
+      return parsed.success ? parsed.data : null;
+    } catch (err) {
+      this.logger.warn({ err, session_id: sessionId }, "discovered lookup failed");
+      return null;
+    }
+  }
+
+  async resumeDiscoveredSession(sessionId: string): Promise<Session> {
+    const meta = await this.getDiscoveredSession(sessionId);
+    if (!meta) throw new Error(`no on-disk session for ${sessionId}`);
+    return this.spawnSession({
+      agent: meta.agent,
+      cwd: meta.cwd,
+      sessionId: meta.session_id,
+      resume: true,
+    });
+  }
+
+  async setSessionLabel(sessionId: string, label: string): Promise<void> {
+    const trimmed = label.trim();
+    if (trimmed === "") {
+      this.labels.clear(sessionId);
+    } else {
+      this.labels.set(sessionId, trimmed, Date.now());
+    }
   }
 
   private async callWorker(

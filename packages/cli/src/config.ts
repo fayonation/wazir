@@ -39,7 +39,6 @@ export function defaultConfig(input: {
   dbPath: string;
   allowlist?: number[];
   telegramTokenEnv?: string;
-  telegramKeychainAccount?: string;
 }): WazirConfig {
   return {
     version: 1,
@@ -59,7 +58,6 @@ export function defaultConfig(input: {
         enabled: true,
         config: {
           token_env: input.telegramTokenEnv ?? "WAZIR_TELEGRAM_TOKEN",
-          token_keychain_account: input.telegramKeychainAccount,
           allowlist: input.allowlist ?? [],
           use_inline_buttons: true,
           max_command_chars: 1200,

@@ -2,7 +2,6 @@ import type { InterfaceAdapter, WazirConfig } from "@wazir/protocol";
 import { CliAdapter } from "@wazir/adapter-cli";
 import { TelegramAdapter } from "@wazir/adapter-telegram";
 import { resolveTelegramToken } from "./secrets.js";
-import { KEYCHAIN_TELEGRAM_ACCOUNT } from "./paths.js";
 
 export interface AdapterBuildContext {
   logger?: { info: (...a: unknown[]) => void; warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void };
@@ -17,11 +16,7 @@ export async function buildAdapters(
   for (const a of config.adapters) {
     if (!a.enabled && !(ctx.forceCli && a.name === "cli")) continue;
     if (a.name === "telegram") {
-      const token = await resolveTelegramToken(
-        a.config.token_env,
-        Boolean(a.config.token_keychain_account),
-        a.config.token_keychain_account ?? KEYCHAIN_TELEGRAM_ACCOUNT,
-      );
+      const token = resolveTelegramToken(a.config.token_env);
       if (!token) {
         ctx.logger?.warn(
           `telegram adapter enabled but no token found (env=${a.config.token_env}). Skipping.`,

@@ -3,12 +3,33 @@ import type { Context } from "telegraf";
 import type { Message } from "telegraf/types";
 import type {
   AdapterHandlers,
+  DiscoveredSession,
   HubNotification,
   InterfaceAdapter,
   Session,
   SessionService,
   UserDecision,
 } from "@wazir/protocol";
+
+/** A unified entry in the chat's /list view — either a live tmux session or an on-disk session. */
+interface ListEntry {
+  kind: "tracked" | "discovered";
+  session_id: string;
+  agent: string;
+  cwd: string;
+  /** Wazir-set name (settable via /rename in Telegram). */
+  label?: string;
+  /** Claude Code's user-set title (via its own /rename inside the TUI). */
+  agent_title?: string;
+  /** Claude Code's auto-generated AI title. */
+  ai_title?: string;
+  /** First user message in the JSONL, shown as the snippet. */
+  first_message?: string;
+  message_count?: number;
+  last_activity_at: number;
+  /** Only set for tracked entries. */
+  status?: string;
+}
 
 export interface TelegramAdapterOptions {
   token: string;
@@ -47,8 +68,9 @@ const NOOP_LOGGER = {
 
 const HELP_TEXT = `*Wazir commands*
 \`/new [agent]\` — spawn a session (default: claude)
-\`/list\` — list known sessions
-\`/resume <n|id>\` — switch active session
+\`/list\` — list all sessions (tracked + on-disk)
+\`/resume <n|id>\` — switch active session (resumes from disk if needed)
+\`/rename <n|id> <name>\` — name a session (empty name to clear)
 \`/cwd <path>\` — set this chat's sticky cwd
 \`/end\` — kill the active session
 \`/voice on|off|auto\` — voice reply mode (placeholder until TTS lands)
@@ -114,6 +136,7 @@ export class TelegramAdapter implements InterfaceAdapter {
     this.bot.command("new", async (ctx) => this.cmdNew(ctx));
     this.bot.command("list", async (ctx) => this.cmdList(ctx));
     this.bot.command("resume", async (ctx) => this.cmdResume(ctx));
+    this.bot.command("rename", async (ctx) => this.cmdRename(ctx));
     this.bot.command("cwd", async (ctx) => this.cmdCwd(ctx));
     this.bot.command("end", async (ctx) => this.cmdEnd(ctx));
     this.bot.command("voice", async (ctx) => this.cmdVoice(ctx));
@@ -200,22 +223,143 @@ export class TelegramAdapter implements InterfaceAdapter {
     if (!sessions) return;
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
-    const list = await sessions.listSessions();
-    if (list.length === 0) {
+    const [tracked, discovered] = await Promise.all([
+      sessions.listSessions(),
+      sessions.listDiscoveredSessions(),
+    ]);
+    const allEntries = mergeListEntries(tracked, discovered);
+    if (allEntries.length === 0) {
       await ctx.reply("(no sessions — start one with /new)");
       this.lastListByChat.delete(chatId);
       return;
     }
+    const LIST_LIMIT = 15;
+    const entries = allEntries.slice(0, LIST_LIMIT);
+    const truncated = allEntries.length > LIST_LIMIT;
     const chatState = await sessions.getChatState("telegram", String(chatId));
     const activeId = chatState?.active_session_id ?? null;
-    const ordered = [...list].sort((a, b) => b.last_activity_at - a.last_activity_at);
-    this.lastListByChat.set(chatId, ordered.map((s) => s.session_id));
-    const lines = ordered.map((s, i) => {
-      const marker = s.session_id === activeId ? "★" : " ";
-      const label = s.label ? ` "${s.label}"` : "";
-      return `${marker} ${i + 1}. \`${s.session_id.slice(0, 8)}\` ${s.agent} ${s.cwd}${label} _${s.status}_`;
-    });
-    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+    // Track ALL ids so /resume <n> still maps correctly even past the visible cap
+    this.lastListByChat.set(chatId, allEntries.map((e) => e.session_id));
+
+    const blocks: string[] = [];
+    for (const [i, e] of entries.entries()) {
+      const isActive = e.session_id === activeId;
+      const marker = isActive ? "★" : e.kind === "tracked" ? "🟢" : "⚪";
+      const { text: titleText, source } = resolveTitle(e);
+      const titleSuffix =
+        source === "claude-custom" ? " <i>· claude /rename</i>" :
+        source === "claude-ai" ? " <i>· auto</i>" :
+        "";
+      const snippet = e.first_message ? `<i>"${escapeHtml(truncate(e.first_message, 70))}"</i>` : "";
+      const recency = formatRelative(e.last_activity_at);
+      const msgCount = e.message_count !== undefined ? `${e.message_count} msgs · ` : "";
+      const statusBit = e.kind === "tracked" ? `${escapeHtml(e.status ?? "?")} · ` : "";
+      const meta = `<code>${e.session_id.slice(0, 8)}</code> · ${statusBit}${msgCount}${recency} · ${escapeHtml(shortCwd(e.cwd))}`;
+      const header = `${marker} <b>${i + 1}. ${escapeHtml(truncate(titleText, 60))}</b>${titleSuffix}`;
+      const lines = [header];
+      if (snippet) lines.push(`   ${snippet}`);
+      lines.push(`   ${meta}`);
+      blocks.push(lines.join("\n"));
+    }
+
+    const parts: string[] = [blocks.join("\n\n")];
+    if (truncated) {
+      parts.push(`\n…and ${allEntries.length - LIST_LIMIT} older. <i>/resume &lt;id-prefix&gt;</i> reaches them.`);
+    }
+    parts.push("\n★ active · 🟢 running · ⚪ available\n<i>/rename &lt;n&gt; &lt;name&gt;</i> to set a Wazir name");
+    await this.safeReply(ctx, parts.join("\n"), { markdown: false, html: true });
+  }
+
+  private async cmdRename(ctx: Context): Promise<void> {
+    const sessions = this.requireSessionService(ctx);
+    if (!sessions) return;
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    const text = (ctx.message as Message.TextMessage).text;
+    const stripped = text.replace(/^\/rename(?:@\S+)?\s*/, "").trim();
+    if (!stripped) {
+      await ctx.reply("usage: /rename <n|id-prefix> <new name>\n(name can be empty to clear: /rename <n>)");
+      return;
+    }
+    const firstSpace = stripped.indexOf(" ");
+    const arg = firstSpace === -1 ? stripped : stripped.slice(0, firstSpace);
+    const rawName = firstSpace === -1 ? "" : stripped.slice(firstSpace + 1).trim();
+
+    // Resolve target via list cache or full enumeration
+    let targetId: string | undefined;
+    const asNumber = Number.parseInt(arg, 10);
+    if (Number.isFinite(asNumber) && asNumber > 0) {
+      const cached = this.lastListByChat.get(chatId) ?? [];
+      targetId = cached[asNumber - 1];
+    }
+    if (!targetId) {
+      const [tracked, discovered] = await Promise.all([
+        sessions.listSessions(),
+        sessions.listDiscoveredSessions(),
+      ]);
+      const all = [...tracked.map((s) => s.session_id), ...discovered.map((d) => d.session_id)];
+      targetId = all.find((id) => id.startsWith(arg));
+    }
+    if (!targetId) {
+      await ctx.reply(`no session matches '${arg}' (try /list first)`);
+      return;
+    }
+    try {
+      await sessions.setSessionLabel(targetId, rawName);
+      const verb = rawName ? `named '${rawName}'` : "cleared";
+      await ctx.reply(`✓ ${targetId.slice(0, 8)} ${verb}`);
+    } catch (err) {
+      await ctx.reply(`rename failed: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Reply that gracefully falls back to plain text if Telegram rejects the
+   * Markdown / HTML parse. Long messages get sliced into chunks under the
+   * 4096 cap (we use 3500 for headroom).
+   */
+  private async safeReply(
+    ctx: Context,
+    body: string,
+    opts: { markdown?: boolean; html?: boolean } = {},
+  ): Promise<void> {
+    const wantMd = opts.markdown ?? false;
+    const wantHtml = opts.html ?? false;
+    const MAX = 3500;
+    const chunks: string[] = [];
+    let i = 0;
+    while (i < body.length) {
+      let end = Math.min(i + MAX, body.length);
+      if (end < body.length) {
+        const nl = body.lastIndexOf("\n\n", end);
+        const nlSingle = body.lastIndexOf("\n", end);
+        const best = nl > i + MAX / 2 ? nl : nlSingle > i + MAX / 2 ? nlSingle : end;
+        end = best;
+      }
+      chunks.push(body.slice(i, end));
+      i = end;
+      while (body[i] === "\n") i++;
+    }
+    for (const chunk of chunks) {
+      try {
+        if (wantHtml) {
+          await ctx.reply(chunk, { parse_mode: "HTML" });
+        } else if (wantMd) {
+          await ctx.reply(chunk, { parse_mode: "Markdown" });
+        } else {
+          await ctx.reply(chunk);
+        }
+      } catch (err) {
+        this.logger.warn({ err }, "telegram reply failed; retrying as plain text");
+        try {
+          // Strip HTML tags before plain fallback so users don't see raw markup
+          const plain = chunk.replace(/<[^>]+>/g, "");
+          await ctx.reply(plain);
+        } catch (err2) {
+          this.logger.error({ err: err2 }, "telegram reply plain-text fallback also failed");
+        }
+      }
+    }
   }
 
   private async cmdResume(ctx: Context): Promise<void> {
@@ -229,29 +373,71 @@ export class TelegramAdapter implements InterfaceAdapter {
       await ctx.reply("usage: `/resume <list-number | session-id-prefix>`", { parse_mode: "Markdown" });
       return;
     }
-    let target: Session | undefined;
+
+    const [tracked, discovered] = await Promise.all([
+      sessions.listSessions(),
+      sessions.listDiscoveredSessions(),
+    ]);
+    const entries = mergeListEntries(tracked, discovered);
+
+    let chosen: ListEntry | undefined;
     const asNumber = Number.parseInt(arg, 10);
     if (Number.isFinite(asNumber) && asNumber > 0) {
-      const ordered = this.lastListByChat.get(chatId) ?? [];
+      const ordered = this.lastListByChat.get(chatId) ?? entries.map((e) => e.session_id);
       const id = ordered[asNumber - 1];
-      if (id) {
-        const list = await sessions.listSessions();
-        target = list.find((s) => s.session_id === id);
-      }
+      if (id) chosen = entries.find((e) => e.session_id === id);
     }
-    if (!target) {
-      const list = await sessions.listSessions();
-      target = list.find((s) => s.session_id.startsWith(arg));
-    }
-    if (!target) {
+    if (!chosen) chosen = entries.find((e) => e.session_id.startsWith(arg));
+
+    if (!chosen) {
       await ctx.reply(`no session matches \`${arg}\` (try /list)`, { parse_mode: "Markdown" });
       return;
     }
-    await sessions.setChatState("telegram", String(chatId), { active_session_id: target.session_id });
-    await ctx.reply(
-      `★ active = \`${target.session_id.slice(0, 8)}\` (${target.agent}, ${target.status})\n_summary coming in a follow-up commit_`,
-      { parse_mode: "Markdown" },
-    );
+
+    let trackedSession: Session;
+    let resumedFromDisk = false;
+    if (chosen.kind === "tracked") {
+      const found = tracked.find((s) => s.session_id === chosen!.session_id);
+      if (!found) {
+        await ctx.reply("internal error: tracked session vanished between list and resume");
+        return;
+      }
+      trackedSession = found;
+    } else {
+      try {
+        trackedSession = await sessions.resumeDiscoveredSession(chosen.session_id);
+        resumedFromDisk = true;
+      } catch (err) {
+        await ctx.reply(`resume failed: ${(err as Error).message}`);
+        return;
+      }
+    }
+
+    await sessions.setChatState("telegram", String(chatId), {
+      active_session_id: trackedSession.session_id,
+      sticky_cwd: trackedSession.cwd,
+    });
+
+    const summary = await this.formatResumeSummary(sessions, trackedSession, resumedFromDisk);
+    await ctx.reply(summary, { parse_mode: "Markdown" });
+  }
+
+  private async formatResumeSummary(
+    sessions: SessionService,
+    session: Session,
+    resumedFromDisk: boolean,
+  ): Promise<string> {
+    const id = session.session_id.slice(0, 8);
+    const header = resumedFromDisk
+      ? `★ resumed \`${id}\` (${session.agent}) in \`${session.cwd}\``
+      : `★ active = \`${id}\` (${session.agent}, ${session.status})`;
+    const meta = await sessions.getDiscoveredSession(session.session_id);
+    if (!meta) return header;
+    const parts: string[] = [header];
+    if (meta.first_message) parts.push(`*Started:* ${escapeMd(truncate(meta.first_message, 240))}`);
+    if (meta.last_assistant) parts.push(`*Last:* ${escapeMd(truncate(meta.last_assistant, 240))}`);
+    if (meta.message_count > 0) parts.push(`_${meta.message_count} messages · last activity ${formatRelative(meta.last_activity_at)}_`);
+    return parts.join("\n");
   }
 
   private async cmdCwd(ctx: Context): Promise<void> {
@@ -505,6 +691,88 @@ export class TelegramAdapter implements InterfaceAdapter {
     const body = collapsed.length > max ? `…\n${collapsed.slice(-max)}` : collapsed;
     return "```\n" + body + "\n```";
   }
+}
+
+function mergeListEntries(
+  tracked: Session[],
+  discovered: DiscoveredSession[],
+): ListEntry[] {
+  const seen = new Set<string>();
+  const entries: ListEntry[] = [];
+  // Tracked rows take precedence — but they don't carry first_message,
+  // so we try to pull it from the discovered list for the same id.
+  const discoveredById = new Map<string, DiscoveredSession>();
+  for (const d of discovered) discoveredById.set(d.session_id, d);
+
+  for (const s of tracked) {
+    seen.add(s.session_id);
+    const fromDisk = discoveredById.get(s.session_id);
+    const entry: ListEntry = {
+      kind: "tracked",
+      session_id: s.session_id,
+      agent: s.agent,
+      cwd: s.cwd,
+      last_activity_at: s.last_activity_at,
+      status: s.status,
+    };
+    if (s.label !== undefined) entry.label = s.label;
+    if (fromDisk?.first_message !== undefined) entry.first_message = fromDisk.first_message;
+    if (fromDisk?.agent_title !== undefined) entry.agent_title = fromDisk.agent_title;
+    if (fromDisk?.ai_title !== undefined) entry.ai_title = fromDisk.ai_title;
+    if (s.message_count !== undefined) entry.message_count = s.message_count;
+    else if (fromDisk?.message_count !== undefined) entry.message_count = fromDisk.message_count;
+    entries.push(entry);
+  }
+  for (const d of discovered) {
+    if (seen.has(d.session_id)) continue;
+    const entry: ListEntry = {
+      kind: "discovered",
+      session_id: d.session_id,
+      agent: d.agent,
+      cwd: d.cwd,
+      last_activity_at: d.last_activity_at,
+      message_count: d.message_count,
+    };
+    if (d.label !== undefined) entry.label = d.label;
+    if (d.agent_title !== undefined) entry.agent_title = d.agent_title;
+    if (d.ai_title !== undefined) entry.ai_title = d.ai_title;
+    if (d.first_message !== undefined) entry.first_message = d.first_message;
+    entries.push(entry);
+  }
+  entries.sort((a, b) => b.last_activity_at - a.last_activity_at);
+  return entries;
+}
+
+/** Pick the most user-meaningful title for a session, with a clear precedence. */
+function resolveTitle(e: ListEntry): { text: string; source: "wazir" | "claude-custom" | "claude-ai" | "fallback" } {
+  if (e.label) return { text: e.label, source: "wazir" };
+  if (e.agent_title) return { text: e.agent_title, source: "claude-custom" };
+  if (e.ai_title) return { text: e.ai_title, source: "claude-ai" };
+  return { text: "(unnamed)", source: "fallback" };
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function shortCwd(cwd: string): string {
+  const home = process.env.HOME;
+  if (home && cwd.startsWith(home)) return "~" + cwd.slice(home.length);
+  return cwd;
+}
+
+function formatRelative(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 0) return "just now";
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  return new Date(ts).toISOString().slice(0, 10);
 }
 
 function parseArgs(ctx: Context): string[] {

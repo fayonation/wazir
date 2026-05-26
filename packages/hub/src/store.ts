@@ -201,6 +201,45 @@ export class SessionStore {
   }
 }
 
+export class SessionLabelStore {
+  constructor(private readonly db: DB) {}
+
+  get(sessionId: string): string | null {
+    const row = this.db
+      .prepare(`SELECT label FROM session_labels WHERE session_id = ?`)
+      .get(sessionId) as { label: string } | undefined;
+    return row?.label ?? null;
+  }
+
+  getMany(sessionIds: string[]): Map<string, string> {
+    const out = new Map<string, string>();
+    if (sessionIds.length === 0) return out;
+    const placeholders = sessionIds.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(`SELECT session_id, label FROM session_labels WHERE session_id IN (${placeholders})`)
+      .all(...sessionIds) as Array<{ session_id: string; label: string }>;
+    for (const r of rows) out.set(r.session_id, r.label);
+    return out;
+  }
+
+  set(sessionId: string, label: string, now: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO session_labels (session_id, label, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           label = excluded.label,
+           updated_at = excluded.updated_at`,
+      )
+      .run(sessionId, label, now);
+  }
+
+  clear(sessionId: string): boolean {
+    const res = this.db.prepare(`DELETE FROM session_labels WHERE session_id = ?`).run(sessionId);
+    return res.changes > 0;
+  }
+}
+
 export class ChatStateStore {
   constructor(private readonly db: DB) {}
 

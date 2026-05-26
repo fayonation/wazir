@@ -18,7 +18,7 @@ import {
   type Session,
 } from "@wazir/protocol";
 import { openDatabase } from "./db.js";
-import { ApprovalStore, WorkerStore, SessionStore, ChatStateStore } from "./store.js";
+import { ApprovalStore, WorkerStore, SessionStore, ChatStateStore, SessionLabelStore } from "./store.js";
 import { HubSessionService } from "./sessionService.js";
 import { createHmacMiddleware, rawBodyCapture, type RawBodyRequest } from "./hmacMiddleware.js";
 import { RateLimiter } from "./rateLimit.js";
@@ -48,7 +48,8 @@ export async function startHub(opts: HubStartOptions): Promise<HubHandle> {
   const workers = new WorkerStore(db);
   const sessions = new SessionStore(db);
   const chatStates = new ChatStateStore(db);
-  const sessionService = new HubSessionService(sessions, workers, chatStates, opts.hmacSecret, logger);
+  const sessionLabels = new SessionLabelStore(db);
+  const sessionService = new HubSessionService(sessions, workers, chatStates, sessionLabels, opts.hmacSecret, logger);
   const workerDecisionLimiter = new RateLimiter(60, 60_000);
   const workerSubmitLimiter = new RateLimiter(120, 60_000);
 
