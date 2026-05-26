@@ -5,12 +5,14 @@ import {
   SessionSchema,
   SessionCaptureSchema,
   DiscoveredSessionSchema,
+  SessionPromptResponseSchema,
   TranscribeResponseSchema,
   SynthesizeResponseSchema,
   type ChatState,
   type DiscoveredSession,
   type Session,
   type SessionCapture,
+  type SessionPromptResponse,
   type SessionService,
 } from "@wazir/protocol";
 import { z } from "zod";
@@ -45,6 +47,7 @@ export class HubSessionService implements SessionService {
     sessionId?: string;
     resume?: boolean;
     label?: string;
+    mode?: "print" | "tmux";
   }): Promise<Session> {
     const worker = this.workers.listWorkers()[0];
     if (!worker || !worker.worker_url) {
@@ -54,6 +57,7 @@ export class HubSessionService implements SessionService {
       agent: req.agent,
       cwd: req.cwd,
       resume: req.resume ?? false,
+      mode: req.mode ?? "print",
     };
     if (req.sessionId) body.session_id = req.sessionId;
     if (req.label) body.label = req.label;
@@ -79,6 +83,28 @@ export class HubSessionService implements SessionService {
     }
     this.sessions.delete(sessionId);
     return true;
+  }
+
+  async runPrompt(
+    sessionId: string,
+    text: string,
+    opts: { cwd?: string } = {},
+  ): Promise<SessionPromptResponse> {
+    const row = this.sessions.get(sessionId);
+    if (!row) throw new Error(`unknown session: ${sessionId}`);
+    const worker = this.workers.getWorker(row.worker_id);
+    if (!worker?.worker_url) throw new Error(`worker unavailable for session ${sessionId}`);
+    const cwd = opts.cwd ?? row.cwd;
+    const res = await this.callWorker(
+      worker.worker_url,
+      "POST",
+      `/v1/sessions/${encodeURIComponent(sessionId)}/prompt`,
+      { text, cwd },
+    );
+    if (res.status >= 400) {
+      throw new Error(`worker prompt failed: ${res.status} ${stringifyBody(res.body)}`);
+    }
+    return SessionPromptResponseSchema.parse(res.body);
   }
 
   async sendInput(sessionId: string, text: string, pressEnter = true): Promise<void> {

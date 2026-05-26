@@ -6,6 +6,7 @@ import {
   ApprovalDecisionCallbackSchema,
   SessionSpawnRequestSchema,
   SessionInputRequestSchema,
+  SessionPromptRequestSchema,
   TranscribeRequestSchema,
   SynthesizeRequestSchema,
   type RiskPattern,
@@ -26,6 +27,7 @@ import { discoverClaudeSessions, findClaudeSession } from "./discovery/claude.js
 import { transcribe } from "./transcription/index.js";
 import { synthesize } from "./tts/index.js";
 import { renderPanePng } from "./screenshot/index.js";
+import { runPrintTurn } from "./print/index.js";
 
 export interface WorkerStartOptions {
   workerId: string;
@@ -202,6 +204,7 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
         agent: parsed.data.agent,
         cwd: parsed.data.cwd,
         resume: parsed.data.resume,
+        mode: parsed.data.mode,
       };
       if (parsed.data.session_id !== undefined) spawnOpts.sessionId = parsed.data.session_id;
       if (parsed.data.label !== undefined) spawnOpts.label = parsed.data.label;
@@ -219,6 +222,40 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
       res.json({ sessions: list });
     } catch (err) {
       res.status(500).json({ error: "list_failed", detail: (err as Error).message });
+    }
+  });
+
+  app.post("/v1/sessions/:session_id/prompt", hmac, async (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const parsed = SessionPromptRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_body", details: parsed.error.flatten() });
+      return;
+    }
+    try {
+      // If a tmux pane is still running claude interactively on this
+      // session, kill it first — two claude processes appending to the
+      // same JSONL would corrupt it.
+      await tmuxManager.releaseTmuxPane(sessionId);
+      const result = await runPrintTurn({
+        sessionId,
+        prompt: parsed.data.text,
+        cwd: parsed.data.cwd,
+      });
+      logger.info(
+        { session_id: sessionId, duration_ms: result.durationMs, chars: result.text.length, tool_count: result.tools.length },
+        "print turn complete",
+      );
+      res.json({
+        text: result.text,
+        tools: result.tools,
+        duration_ms: result.durationMs,
+        stop_reason: result.stopReason,
+      });
+    } catch (err) {
+      logger.error({ err, session_id: sessionId }, "print turn failed");
+      res.status(500).json({ error: "prompt_failed", detail: (err as Error).message });
     }
   });
 

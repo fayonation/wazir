@@ -1,6 +1,6 @@
 import type { HubNotification } from "./notification.js";
 import type { UserDecision } from "./approval.js";
-import type { Session, SessionCapture, DiscoveredSession } from "./session.js";
+import type { Session, SessionCapture, DiscoveredSession, SessionPromptResponse } from "./session.js";
 
 export type DecisionHandler = (approvalId: string, decision: UserDecision) => Promise<void>;
 
@@ -44,11 +44,27 @@ export interface SessionService {
     sessionId?: string;
     resume?: boolean;
     label?: string;
+    /**
+     * "print" (default) — register the session without spawning a tmux
+     * pane; turns will be driven by `claude --print --resume` from the
+     * worker.
+     * "tmux" — legacy interactive tmux session.
+     */
+    mode?: "print" | "tmux";
   }): Promise<Session>;
 
   killSession(sessionId: string): Promise<boolean>;
 
   sendInput(sessionId: string, text: string, pressEnter?: boolean): Promise<void>;
+
+  /**
+   * Run one non-interactive Claude Code turn against the session via
+   * `claude --print --resume`. Returns the final assistant text plus
+   * metadata about tools used. This is the preferred path for
+   * adapter→agent communication — the alternative (`sendInput` +
+   * pane/JSONL polling) is the legacy tmux flow.
+   */
+  runPrompt(sessionId: string, text: string, opts?: { cwd?: string }): Promise<SessionPromptResponse>;
 
   capturePane(
     sessionId: string,

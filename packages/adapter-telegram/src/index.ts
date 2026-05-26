@@ -781,18 +781,16 @@ export class TelegramAdapter implements InterfaceAdapter {
   }
 
   /**
-   * Type `text` into a session's pane, hold a "typing..." indicator while the
-   * agent works, then reply with the response when it settles.
+   * Drive one Claude turn for the active session and reply with the result.
+   *
+   * Runs `claude --print --resume <session-id>` via the hub. Each user
+   * message is one short-lived process, so there's no pane to scrape, no
+   * polling for completion, and no chance of two concurrent deliveries
+   * racing over the same session. Per-session serialization is still
+   * enforced (two consecutive Telegram messages run sequentially) because
+   * two claude processes against one JSONL would corrupt it.
+   *
    * Shared by `onText`, `onVoice`, and image handlers.
-   *
-   * Concurrency: deliveries are serialized per session. Two messages sent
-   * back-to-back will run in order rather than racing two pollers on the
-   * same pane (which used to cause Handler B to capture Handler A's
-   * response and Handler B's actual response to be lost).
-   *
-   * Response priority:
-   *   1. last_assistant from the JSONL (clean markdown text, no TUI chrome)
-   *   2. cleaned visible pane output (fallback if JSONL isn't ready)
    */
   private async deliverPromptAndStream(
     ctx: Context,
@@ -835,12 +833,27 @@ export class TelegramAdapter implements InterfaceAdapter {
         }
       };
 
-      // 3. Drive the session. Snapshot JSONL state BEFORE sending so we can
-      // detect the new assistant turn by diffing message_count and
-      // last_assistant against this baseline.
-      const beforeMeta = await sessions.getDiscoveredSession(sessionId).catch(() => null);
+      const typingTimer = setInterval(() => {
+        void ctx.telegram.sendChatAction(chatId, "typing").catch(() => {});
+      }, 4000);
+      typingTimer.unref?.();
+
+      // 3. Drive the session via `claude --print --resume`. One process
+      //    per message → no race, no pane scraping, no JSONL polling.
+      //    The process exit is the unambiguous "done" signal.
       try {
-        await sessions.sendInput(sessionId, text);
+        const result = await sessions.runPrompt(sessionId, text);
+        deleteWorking();
+        if (result.text) {
+          await this.deliverResponse(ctx, sessions, chatId, result.text);
+        } else {
+          // No text in response — happens when Claude only ran tools and
+          // didn't write a final message (e.g. ended on an approval).
+          const summary = result.tools.length > 0
+            ? `(no text response — ran ${result.tools.length} tool${result.tools.length === 1 ? "" : "s"}: ${result.tools.slice(0, 3).map((t) => t.name).join(", ")})`
+            : "(no response — Claude may be blocked on an approval)";
+          await ctx.reply(summary);
+        }
       } catch (err) {
         deleteWorking();
         const msg = (err as Error).message;
@@ -850,45 +863,8 @@ export class TelegramAdapter implements InterfaceAdapter {
             "Use /list then /resume to reconnect.",
           );
         } else {
-          await ctx.reply(`Could not send message: ${msg}`);
+          await ctx.reply(`(turn failed: ${msg})`);
         }
-        return;
-      }
-
-      const typingTimer = setInterval(() => {
-        void ctx.telegram.sendChatAction(chatId, "typing").catch(() => {});
-      }, 4000);
-      typingTimer.unref?.();
-
-      try {
-        // Primary signal: wait for a new assistant turn in the JSONL.
-        // This is authoritative — JSONL is only written when Claude
-        // completes a turn — so it sidesteps all the timing pitfalls of
-        // polling the visible pane (status-bar gaps, input echo,
-        // streaming pauses, etc.).
-        const response = await this.waitForAssistantResponse(sessions, sessionId, beforeMeta);
-        deleteWorking();
-        if (response) {
-          await this.deliverResponse(ctx, sessions, chatId, response);
-        } else {
-          // Fall back to pane scraping if JSONL never recorded a new
-          // assistant message (e.g. session not yet in discovery, or
-          // Claude is blocked on an approval).
-          try {
-            const cap = await sessions.capturePane(sessionId, { visibleOnly: true });
-            const cleaned = cleanPaneText(cap.text);
-            if (cleaned) {
-              await this.deliverResponse(ctx, sessions, chatId, cleaned);
-            } else {
-              await ctx.reply("(no response detected within timeout — Claude may be blocked on a tool approval, or the session is idle)");
-            }
-          } catch (err) {
-            await ctx.reply(`(could not capture response: ${(err as Error).message})`);
-          }
-        }
-      } catch (err) {
-        deleteWorking();
-        await ctx.reply(`(delivery failed: ${(err as Error).message})`);
       } finally {
         clearInterval(typingTimer);
       }

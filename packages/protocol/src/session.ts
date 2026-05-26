@@ -28,6 +28,12 @@ export const SessionSpawnRequestSchema = z.object({
   session_id: z.string().uuid().optional(),
   resume: z.boolean().default(false),
   label: z.string().max(120).optional(),
+  /**
+   * "print" (default) — register the session record only; turns will be
+   *   driven by `claude --print --resume` from outside.
+   * "tmux" — legacy interactive tmux pane.
+   */
+  mode: z.enum(["print", "tmux"]).default("print"),
 });
 
 export type SessionSpawnRequest = z.infer<typeof SessionSpawnRequestSchema>;
@@ -39,6 +45,31 @@ export const SessionInputRequestSchema = z.object({
 });
 
 export type SessionInputRequest = z.infer<typeof SessionInputRequestSchema>;
+
+/**
+ * Request body for running one non-interactive turn against a session via
+ * `claude --print --resume`. This is the preferred path for the Telegram
+ * adapter — each user message is one short-lived process and the response
+ * comes back as a single string instead of being scraped from a tmux pane.
+ */
+export const SessionPromptRequestSchema = z.object({
+  text: z.string().min(1),
+  cwd: z.string().min(1),
+});
+
+export type SessionPromptRequest = z.infer<typeof SessionPromptRequestSchema>;
+
+/** What the worker returns from /v1/sessions/:id/prompt. */
+export const SessionPromptResponseSchema = z.object({
+  text: z.string(),
+  tools: z.array(
+    z.object({ name: z.string(), preview: z.string() }),
+  ),
+  duration_ms: z.number().int().nonnegative(),
+  stop_reason: z.string().nullable(),
+});
+
+export type SessionPromptResponse = z.infer<typeof SessionPromptResponseSchema>;
 
 /** Response from a pane capture. */
 export const SessionCaptureSchema = z.object({

@@ -19,6 +19,20 @@ export interface SpawnOptions {
    * Passed as discrete argv entries — no shell.
    */
   command?: string[];
+  /**
+   * "print" (default) — the session is driven via `claude --print --resume`
+   *   from outside; no tmux pane is created. We just track the session id
+   *   plus its cwd in memory so /list/kill/etc. still work. The JSONL is
+   *   created on the first message by `claude --print --session-id`.
+   *
+   * "tmux" — the legacy interactive flow: spawn a tmux pane with `claude`
+   *   running inside, and use `tmux send-keys` for input. Required if you
+   *   want `/screen` / `/capture` to reflect a live TUI for this session.
+   *
+   * Print mode and tmux mode CANNOT coexist on the same session_id — two
+   * Claude processes appending to the same JSONL would corrupt it.
+   */
+  mode?: "print" | "tmux";
 }
 
 export interface CaptureOptions {
@@ -42,6 +56,13 @@ export interface CaptureResult {
 interface TrackedSession {
   session: Session;
   paneCursor: number;
+  /**
+   * Whether this session is backed by a tmux pane ("tmux") or driven
+   * externally via `claude --print --resume` ("print"). Print-mode
+   * sessions don't have a live process to check, so listSessions
+   * reports them as running until they're killed.
+   */
+  mode: "print" | "tmux";
 }
 
 export class TmuxManager {
@@ -64,31 +85,45 @@ export class TmuxManager {
    */
   async spawnSession(opts: SpawnOptions): Promise<Session> {
     const sessionId = opts.sessionId ?? randomUUID();
-    const tmuxName = `${TMUX_NAME_PREFIX}${opts.agent}-${sessionId}`;
-
-    if (await hasSession(tmuxName)) {
-      throw new TmuxError(`tmux session already exists: ${tmuxName}`, "", null);
-    }
+    const mode = opts.mode ?? "print";
     if (!existsSync(opts.cwd)) {
       throw new Error(`cwd does not exist: ${opts.cwd}`);
     }
-
+    if (mode === "print") {
+      // Print mode: no tmux pane. The session is just a tracked record. The
+      // first `claude --print --session-id <id>` invocation will create the
+      // JSONL on disk; subsequent invocations use `--resume`.
+      const now = Date.now();
+      const session: Session = {
+        session_id: sessionId,
+        worker_id: this.workerId,
+        agent: opts.agent,
+        cwd: opts.cwd,
+        // The Session schema requires tmux_name; use the same name we'd
+        // pick for a real tmux pane so /screen etc. can flip to tmux mode
+        // later if we want, but never actually spawn it.
+        tmux_name: `${TMUX_NAME_PREFIX}${opts.agent}-${sessionId}`,
+        status: "running",
+        created_at: now,
+        last_activity_at: now,
+        ...(opts.label !== undefined ? { label: opts.label } : {}),
+      };
+      this.tracked.set(sessionId, { session, paneCursor: 0, mode });
+      this.logger.info({ session_id: sessionId, agent: opts.agent, cwd: opts.cwd }, "session registered (print mode)");
+      return session;
+    }
+    // mode === "tmux" — legacy interactive flow.
+    const tmuxName = `${TMUX_NAME_PREFIX}${opts.agent}-${sessionId}`;
+    if (await hasSession(tmuxName)) {
+      throw new TmuxError(`tmux session already exists: ${tmuxName}`, "", null);
+    }
     const paneShell = process.env.SHELL ?? "/bin/bash";
-    // tmux new-session -d -s <name> -c <cwd> <shell>
-    // (omit `--` so tmux gets a single shell-command string; this avoids
-    // argv-joining surprises across tmux versions.)
     await tmux(["new-session", "-d", "-s", tmuxName, "-c", opts.cwd, paneShell]);
-
-    // Type the agent invocation into the freshly-opened shell. If the agent
-    // exits later, the user is left in an interactive shell instead of a
-    // dead pane.
     const agentInvocation = (opts.command ?? defaultCommandFor(opts.agent, sessionId, Boolean(opts.resume)))
       .map(quoteForShell)
       .join(" ");
-    // Use -l (literal) so quoting in the command string isn't re-interpreted.
     await tmux(["send-keys", "-t", tmuxName, "-l", "--", agentInvocation]);
     await tmux(["send-keys", "-t", tmuxName, "Enter"]);
-
     const now = Date.now();
     const session: Session = {
       session_id: sessionId,
@@ -101,7 +136,7 @@ export class TmuxManager {
       last_activity_at: now,
       ...(opts.label !== undefined ? { label: opts.label } : {}),
     };
-    this.tracked.set(sessionId, { session, paneCursor: 0 });
+    this.tracked.set(sessionId, { session, paneCursor: 0, mode });
     this.logger.info({ session_id: sessionId, tmux_name: tmuxName, agent: opts.agent, cwd: opts.cwd }, "tmux session spawned");
     return session;
   }
@@ -112,6 +147,11 @@ export class TmuxManager {
     const liveByName = new Map(live.map((s) => [s.name, s.createdAt] as const));
 
     for (const tracked of this.tracked.values()) {
+      if (tracked.mode === "print") {
+        // No tmux pane to check; print sessions live as long as we track them.
+        tracked.session.status = "running";
+        continue;
+      }
       const isAlive = liveByName.has(tracked.session.tmux_name);
       tracked.session.status = isAlive ? "running" : "exited";
     }
@@ -223,7 +263,7 @@ export class TmuxManager {
         created_at: s.createdAt,
         last_activity_at: s.createdAt,
       };
-      this.tracked.set(sessionId, { session, paneCursor: 0 });
+      this.tracked.set(sessionId, { session, paneCursor: 0, mode: "tmux" });
       count++;
       this.logger.info({ session_id: sessionId, tmux_name: s.name, agent }, "rehydrated session from live tmux");
     }
@@ -233,6 +273,28 @@ export class TmuxManager {
   /** Forget a single session without killing tmux. Used when reconciliation finds it gone. */
   forget(sessionId: string): void {
     this.tracked.delete(sessionId);
+  }
+
+  /**
+   * If `sessionId` currently has a live tmux pane, kill the pane but keep
+   * the tracked record alive in print mode. Used when we're about to run
+   * `claude --print --resume <id>` against this session: two `claude`
+   * processes appending to the same JSONL would corrupt it, so we hand
+   * ownership of the session over to the print runner.
+   *
+   * No-op if the session is already in print mode or not tracked.
+   */
+  async releaseTmuxPane(sessionId: string): Promise<void> {
+    const tracked = this.tracked.get(sessionId);
+    if (!tracked) return;
+    if (tracked.mode !== "tmux") return;
+    try {
+      await tmux(["kill-session", "-t", tracked.session.tmux_name]);
+    } catch (err) {
+      this.logger.warn({ err, session_id: sessionId }, "tmux kill on release failed (pane already gone?)");
+    }
+    tracked.mode = "print";
+    this.logger.info({ session_id: sessionId, tmux_name: tracked.session.tmux_name }, "tmux pane released; session now in print mode");
   }
 }
 
