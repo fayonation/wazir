@@ -259,6 +259,78 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
     }
   });
 
+  /**
+   * SSE variant of the prompt endpoint. The browser-side dashboard connects
+   * here to see assistant text tokens stream in as they arrive, mirroring
+   * the Claude TUI's typing-out behaviour.
+   *
+   * Event types emitted (each a `data:` line followed by a blank line):
+   *   text  — delta of assistant text. payload: { delta: string }
+   *   tool  — a tool started. payload: { name, preview }
+   *   done  — final aggregate. payload: { text, tools, duration_ms, stop_reason }
+   *   error — terminal error. payload: { detail: string }
+   *
+   * Auth: same HMAC middleware as the JSON endpoint. The hub bridges this
+   * stream to the browser (which can't sign), so the browser-facing surface
+   * lives on the hub side.
+   */
+  app.post("/v1/sessions/:session_id/prompt-stream", hmac, async (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const parsed = SessionPromptRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_body", details: parsed.error.flatten() });
+      return;
+    }
+
+    res.set({
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      "connection": "keep-alive",
+      "x-accel-buffering": "no", // disable nginx buffering if present
+    });
+    res.flushHeaders();
+
+    const write = (event: string, payload: unknown) => {
+      try {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+      } catch { /* client disconnected */ }
+    };
+
+    // Heartbeat so intermediaries don't close the idle connection.
+    const heartbeat = setInterval(() => {
+      try { res.write(":heartbeat\n\n"); } catch { /* client gone */ }
+    }, 15_000);
+    heartbeat.unref?.();
+
+    try {
+      await tmuxManager.releaseTmuxPane(sessionId);
+      const result = await runPrintTurn({
+        sessionId,
+        prompt: parsed.data.text,
+        cwd: parsed.data.cwd,
+        onText: (delta) => write("text", { delta }),
+        onToolUse: (evt) => write("tool", evt),
+      });
+      write("done", {
+        text: result.text,
+        tools: result.tools,
+        duration_ms: result.durationMs,
+        stop_reason: result.stopReason,
+      });
+      logger.info(
+        { session_id: sessionId, duration_ms: result.durationMs, chars: result.text.length, tool_count: result.tools.length },
+        "print stream complete",
+      );
+    } catch (err) {
+      logger.error({ err, session_id: sessionId }, "print stream failed");
+      write("error", { detail: (err as Error).message });
+    } finally {
+      clearInterval(heartbeat);
+      try { res.end(); } catch { /* already ended */ }
+    }
+  });
+
   app.post("/v1/sessions/:session_id/input", hmac, async (req: RawBodyRequest, res: Response) => {
     const sessionId = req.params.session_id;
     if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
