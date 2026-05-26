@@ -31,6 +31,7 @@ export async function buildAdapters(
           token,
           allowlist: a.config.allowlist,
           maxCommandChars: a.config.max_command_chars,
+          chatEnabled: a.config.chat_enabled,
           defaultCwd: process.env.HOME ?? "/",
           logger: ctx.logger,
         }),

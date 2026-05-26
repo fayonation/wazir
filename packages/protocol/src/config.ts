@@ -13,6 +13,13 @@ export const TelegramAdapterConfigSchema = z.object({
   allowlist: z.array(z.number().int()).default([]),
   use_inline_buttons: z.boolean().default(true),
   max_command_chars: z.number().int().positive().default(1200),
+  /**
+   * If true, the Telegram bot also accepts chat-style messages (text,
+   * voice notes, images) and routes them to the active session. Default
+   * false — Wazir's primary chat surface is the agent's own TUI; the
+   * Telegram bot is approval-only by default.
+   */
+  chat_enabled: z.boolean().default(false),
 });
 
 export type TelegramAdapterConfig = z.infer<typeof TelegramAdapterConfigSchema>;

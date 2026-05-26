@@ -54,6 +54,13 @@ export interface TelegramAdapterOptions {
   stableTicks?: number;
   /** Maximum total time (ms) to wait for the agent to settle. Default 45 s. */
   maxWaitMs?: number;
+  /**
+   * Whether the bot accepts chat-style messages (text, voice, image) and
+   * routes them to the active session. Default false — Wazir's primary
+   * chat surface is the agent's own TUI now; Telegram is kept on solely
+   * for the approval flow. Flip to true to restore the full chat bot.
+   */
+  chatEnabled?: boolean;
   logger?: { info: (...a: unknown[]) => void; warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void };
 }
 
@@ -70,7 +77,16 @@ const NOOP_LOGGER = {
   error: () => undefined,
 };
 
-const HELP_TEXT = `*Wazir commands*
+const HELP_APPROVAL_ONLY = `*Wazir — approval bot*
+
+I'm here for one job: when your agent hits a risky command, I show you the prompt with Approve / Reject / Modify buttons. Tap one to unblock it.
+
+Chat-with-your-agent moved to the terminal. From a Claude Code session run \`/wazir-pending\` (or \`wazir pending\` in any shell) to manage approvals there too.
+
+\`/whoami\` — show your Telegram ids
+\`/help\` — show this message`;
+
+const HELP_CHAT_ENABLED = `*Wazir commands*
 \`/new [agent]\` — spawn a session (default: claude)
 \`/list\` — list all sessions (tracked + on-disk)
 \`/resume <n|id> [force]\` — switch active session (resumes from disk if needed). Add \`force\` to override the "session looks active elsewhere" guard.
@@ -103,6 +119,7 @@ export class TelegramAdapter implements InterfaceAdapter {
   private readonly pollIntervalMs: number;
   private readonly stableTicks: number;
   private readonly maxWaitMs: number;
+  private readonly chatEnabled: boolean;
   private readonly logger: NonNullable<TelegramAdapterOptions["logger"]>;
 
   constructor(opts: TelegramAdapterOptions) {
@@ -112,6 +129,7 @@ export class TelegramAdapter implements InterfaceAdapter {
     this.pollIntervalMs = opts.pollIntervalMs ?? 1500;
     this.stableTicks = opts.stableTicks ?? 2;
     this.maxWaitMs = opts.maxWaitMs ?? 180_000;
+    this.chatEnabled = opts.chatEnabled ?? false;
     this.logger = opts.logger ?? NOOP_LOGGER;
     this.bot = new Telegraf(opts.token);
     this.bot.catch((err, ctx) => {
@@ -131,43 +149,55 @@ export class TelegramAdapter implements InterfaceAdapter {
       await next();
     });
 
+    const helpText = this.chatEnabled ? HELP_CHAT_ENABLED : HELP_APPROVAL_ONLY;
+
     this.bot.command("start", async (ctx) => {
       await ctx.reply(`Wazir bot online.\nchat_id: ${ctx.chat.id}\nuser_id: ${ctx.from.id}`);
-      await ctx.reply(HELP_TEXT, { parse_mode: "Markdown" });
+      await ctx.reply(helpText, { parse_mode: "Markdown" });
     });
 
     this.bot.command("help", async (ctx) => {
-      await ctx.reply(HELP_TEXT, { parse_mode: "Markdown" });
+      await ctx.reply(helpText, { parse_mode: "Markdown" });
     });
 
     this.bot.command("whoami", async (ctx) => {
       await ctx.reply(`chat_id: ${ctx.chat.id}\nuser_id: ${ctx.from.id}`);
     });
 
-    this.bot.command("new", async (ctx) => this.cmdNew(ctx));
-    this.bot.command("list", async (ctx) => this.cmdList(ctx));
-    this.bot.command("resume", async (ctx) => this.cmdResume(ctx));
-    this.bot.command("switch", async (ctx) => this.cmdSwitch(ctx));
-    this.bot.command("rename", async (ctx) => this.cmdRename(ctx));
-    this.bot.command("cwd", async (ctx) => this.cmdCwd(ctx));
-    this.bot.command("end", async (ctx) => this.cmdEnd(ctx));
-    this.bot.command("voice", async (ctx) => this.cmdVoice(ctx));
-    this.bot.command("say", async (ctx) => this.cmdSay(ctx));
-    this.bot.command("capture", async (ctx) => this.cmdCapture(ctx));
-    this.bot.command("screen", async (ctx) => this.cmdScreen(ctx));
-    this.bot.command("clear", async (ctx) => this.cmdClearSession(ctx));
+    if (this.chatEnabled) {
+      // Full chat experience: session management commands + free-text/voice/image
+      // routing to the active session. Kept behind `chat_enabled` for users
+      // who explicitly want Telegram-as-chat; the default is approval-only.
+      this.bot.command("new", async (ctx) => this.cmdNew(ctx));
+      this.bot.command("list", async (ctx) => this.cmdList(ctx));
+      this.bot.command("resume", async (ctx) => this.cmdResume(ctx));
+      this.bot.command("switch", async (ctx) => this.cmdSwitch(ctx));
+      this.bot.command("rename", async (ctx) => this.cmdRename(ctx));
+      this.bot.command("cwd", async (ctx) => this.cmdCwd(ctx));
+      this.bot.command("end", async (ctx) => this.cmdEnd(ctx));
+      this.bot.command("voice", async (ctx) => this.cmdVoice(ctx));
+      this.bot.command("say", async (ctx) => this.cmdSay(ctx));
+      this.bot.command("capture", async (ctx) => this.cmdCapture(ctx));
+      this.bot.command("screen", async (ctx) => this.cmdScreen(ctx));
+      this.bot.command("clear", async (ctx) => this.cmdClearSession(ctx));
+
+      this.bot.on("voice", async (ctx) => this.onVoice(ctx));
+      this.bot.on("audio", async (ctx) => this.onAudio(ctx));
+      this.bot.on("photo", async (ctx) => this.onPhoto(ctx));
+      this.bot.on("document", async (ctx) => this.onDocument(ctx));
+    }
 
     this.bot.on("callback_query", async (ctx) => this.onCallback(ctx));
 
+    // Text handler is always on. When chat is disabled, it only services
+    // the modify-approval flow (a user typing a replacement command after
+    // tapping the Modify button); anything else gets a polite nudge to
+    // use the terminal / CLI instead.
     this.bot.on("text", async (ctx) => this.onText(ctx));
-    this.bot.on("voice", async (ctx) => this.onVoice(ctx));
-    this.bot.on("audio", async (ctx) => this.onAudio(ctx));
-    this.bot.on("photo", async (ctx) => this.onPhoto(ctx));
-    this.bot.on("document", async (ctx) => this.onDocument(ctx));
 
     await this.bot.telegram.getMe();
     this.bot.launch().catch((err: unknown) => this.logger.error({ err }, "telegram launch error"));
-    this.logger.info("telegram adapter started");
+    this.logger.info({ chat_enabled: this.chatEnabled }, "telegram adapter started");
   }
 
   async sendNotification(n: HubNotification): Promise<void> {
@@ -766,7 +796,18 @@ export class TelegramAdapter implements InterfaceAdapter {
       return;
     }
 
-    // 2) otherwise route to the active session
+    // 2) if chat is disabled (the default), Telegram is approval-only.
+    if (!this.chatEnabled) {
+      await ctx.reply(
+        "I'm only here for approvals. Talk to your agent from the terminal — " +
+        "use `/wazir-pending` from Claude Code (or `wazir pending` in any shell) " +
+        "to see waiting decisions.",
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
+    // 3) chat is enabled — route to the active session
     const sessions = this.handlers?.sessions;
     if (!sessions) {
       await ctx.reply("(no session service available — hub not wired)");

@@ -61,6 +61,7 @@ export function defaultConfig(input: {
           allowlist: input.allowlist ?? [],
           use_inline_buttons: true,
           max_command_chars: 1200,
+          chat_enabled: false,
         },
       },
       {

@@ -1,5 +1,6 @@
 import express, { type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import type { Server } from "node:http";
 import { z } from "zod";
 import {
@@ -171,6 +172,7 @@ export async function startHub(opts: HubStartOptions): Promise<HubHandle> {
 
     try {
       await registry.broadcast(notification);
+      desktopNotify(notification.title, notification.body);
     } catch (err) {
       logger.error({ err, approval_id: approvalId }, "broadcast failed; rejecting approval");
       pending.resolve(approvalId);
@@ -449,6 +451,24 @@ export async function startHub(opts: HubStartOptions): Promise<HubHandle> {
       logger.info("hub stopped");
     },
   };
+}
+
+/**
+ * Fire a non-blocking macOS desktop notification when a new approval is
+ * broadcast. Lets the user know to check Telegram or run `wazir pending`.
+ * Silently no-ops on non-Mac platforms (osascript missing).
+ */
+function desktopNotify(title: string, body: string): void {
+  if (process.platform !== "darwin") return;
+  // Strip newlines / quote chars so the AppleScript string stays well-formed.
+  const safeTitle = title.replace(/["\\\n]/g, " ").slice(0, 80);
+  const safeBody = body.replace(/["\\\n]/g, " ").slice(0, 240);
+  const script = `display notification "${safeBody}" with title "Wazir" subtitle "${safeTitle}" sound name "Submarine"`;
+  execFile("osascript", ["-e", script], (err) => {
+    if (err) {
+      // Don't surface — notifications are best-effort.
+    }
+  });
 }
 
 function buildNotification(approvalId: string, req: ApprovalRequest, now: number): HubNotification {

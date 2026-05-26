@@ -24,6 +24,12 @@ import {
   runSessionSend,
   runSessionCapture,
 } from "./commands/session.js";
+import {
+  runApprovalPending,
+  runApprovalApprove,
+  runApprovalReject,
+  runApprovalModify,
+} from "./commands/approval.js";
 
 const program = new Command();
 
@@ -140,6 +146,34 @@ session
     const args: { since?: string } = {};
     if (opts.since) args.since = opts.since;
     await runSessionCapture(idPrefix, args);
+  });
+
+program
+  .command("pending")
+  .description("List pending approvals (waiting for a decision).")
+  .action(async () => {
+    await runApprovalPending();
+  });
+
+program
+  .command("approve [id-prefix]")
+  .description("Approve a pending approval. Omits the id if exactly one is pending.")
+  .action(async (idPrefix: string | undefined) => {
+    await runApprovalApprove(idPrefix);
+  });
+
+program
+  .command("reject [id-prefix]")
+  .description("Reject a pending approval. Omits the id if exactly one is pending.")
+  .action(async (idPrefix: string | undefined) => {
+    await runApprovalReject(idPrefix);
+  });
+
+program
+  .command("modify <id-prefix> <new-command...>")
+  .description("Approve with a modified command (will run instead of the original).")
+  .action(async (idPrefix: string, parts: string[]) => {
+    await runApprovalModify(idPrefix, parts.join(" "));
   });
 
 program
