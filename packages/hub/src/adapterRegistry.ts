@@ -1,4 +1,4 @@
-import type { InterfaceAdapter, HubNotification, UserDecision } from "@wazir/protocol";
+import type { InterfaceAdapter, HubNotification, UserDecision, SessionService } from "@wazir/protocol";
 import type { HubLogger } from "./logger.js";
 
 export type DecisionRouter = (approvalId: string, decision: UserDecision) => Promise<void>;
@@ -9,10 +9,14 @@ export class AdapterRegistry {
   constructor(
     private readonly logger: HubLogger,
     private readonly onDecision: DecisionRouter,
+    private readonly sessionService: SessionService | undefined,
   ) {}
 
   async register(adapter: InterfaceAdapter): Promise<void> {
-    await adapter.start({ onDecision: this.onDecision });
+    await adapter.start({
+      onDecision: this.onDecision,
+      ...(this.sessionService ? { sessions: this.sessionService } : {}),
+    });
     this.adapters.push(adapter);
     this.logger.info({ adapter: adapter.name }, "adapter registered");
   }

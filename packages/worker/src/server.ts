@@ -232,10 +232,14 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
     const sessionId = req.params.session_id;
     if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
     const sinceRaw = req.query.since;
+    const visibleRaw = req.query.visible_only;
     const captureOpts: Parameters<typeof tmuxManager.capturePane>[1] = {};
     if (typeof sinceRaw === "string") {
       const parsed = Number.parseInt(sinceRaw, 10);
       if (Number.isFinite(parsed) && parsed >= 0) captureOpts.since = parsed;
+    }
+    if (typeof visibleRaw === "string" && (visibleRaw === "1" || visibleRaw === "true")) {
+      captureOpts.visibleOnly = true;
     }
     try {
       const result = await tmuxManager.capturePane(sessionId, captureOpts);

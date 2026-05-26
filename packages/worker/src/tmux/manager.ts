@@ -25,6 +25,12 @@ export interface CaptureOptions {
   since?: number;
   /** Maximum bytes to return. Tail is preferred if exceeded. Default 64 KiB. */
   maxBytes?: number;
+  /**
+   * When true, capture only what's currently visible on the pane (no
+   * scrollback). Best for polling TUIs like Claude Code that repaint
+   * in place and where "the answer" is whatever's on the screen now.
+   */
+  visibleOnly?: boolean;
 }
 
 export interface CaptureResult {
@@ -138,12 +144,34 @@ export class TmuxManager {
     });
   }
 
-  /** Read the pane buffer. Uses a per-session byte cursor for delta reads. */
+  /**
+   * Read the pane buffer.
+   *
+   * Default mode: full scrollback + visible, sliced from a per-session
+   * byte cursor for delta reads. Best for shells that append to history.
+   *
+   * `visibleOnly` mode: only the currently visible pane (no scrollback),
+   * returned as-is with no delta tracking. Best for polling TUIs like
+   * Claude Code that repaint in place.
+   */
   async capturePane(sessionId: string, opts: CaptureOptions = {}): Promise<CaptureResult> {
     const tracked = this.tracked.get(sessionId);
     if (!tracked) throw new Error(`unknown session: ${sessionId}`);
-    // capture-pane -t <name> -p -S -                 (whole scrollback as text)
-    // capture-pane -t <name> -p -S <line> -E <line>  (range — but we work by bytes)
+    const maxBytes = opts.maxBytes ?? 64 * 1024;
+    if (opts.visibleOnly) {
+      // capture-pane -t <name> -p -J  (visible pane only, joined wrapped lines)
+      const result = await tmux([
+        "capture-pane",
+        "-t",
+        tracked.session.tmux_name,
+        "-p",
+        "-J",
+      ]);
+      const visible = result.stdout;
+      const tooLong = visible.length > maxBytes;
+      const text = tooLong ? visible.slice(visible.length - maxBytes) : visible;
+      return { text, cursor: visible.length, full: tooLong };
+    }
     const result = await tmux([
       "capture-pane",
       "-t",
@@ -156,7 +184,6 @@ export class TmuxManager {
     const fullText = result.stdout;
     const cursorBefore = opts.since ?? tracked.paneCursor;
     const delta = cursorBefore <= fullText.length ? fullText.slice(cursorBefore) : fullText;
-    const maxBytes = opts.maxBytes ?? 64 * 1024;
     const tooLong = delta.length > maxBytes;
     const text = tooLong ? delta.slice(delta.length - maxBytes) : delta;
     tracked.paneCursor = fullText.length;
