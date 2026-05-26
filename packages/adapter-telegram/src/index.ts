@@ -1,6 +1,10 @@
 import { Telegraf, Markup } from "telegraf";
 import type { Context } from "telegraf";
 import type { Message } from "telegraf/types";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import type {
   AdapterHandlers,
   DiscoveredSession,
@@ -69,12 +73,14 @@ const NOOP_LOGGER = {
 const HELP_TEXT = `*Wazir commands*
 \`/new [agent]\` — spawn a session (default: claude)
 \`/list\` — list all sessions (tracked + on-disk)
-\`/resume <n|id>\` — switch active session (resumes from disk if needed)
+\`/resume <n|id> [force]\` — switch active session (resumes from disk if needed). Add \`force\` to override the "session looks active elsewhere" guard.
 \`/rename <n|id> <name>\` — name a session (empty name to clear)
 \`/cwd <path>\` — set this chat's sticky cwd
 \`/end\` — kill the active session
-\`/voice on|off|auto\` — voice reply mode (placeholder until TTS lands)
-\`/capture\` — re-read the active session's pane
+\`/clear\` — wipe the active session's context (types /clear into the pane)
+\`/voice on|off|auto\` — voice reply mode
+\`/capture\` — re-read the active session's pane (text)
+\`/screen\` — screenshot the active session's pane (image)
 \`/whoami\` — show your Telegram ids
 Any plain text → typed into the active session.`;
 
@@ -141,10 +147,16 @@ export class TelegramAdapter implements InterfaceAdapter {
     this.bot.command("end", async (ctx) => this.cmdEnd(ctx));
     this.bot.command("voice", async (ctx) => this.cmdVoice(ctx));
     this.bot.command("capture", async (ctx) => this.cmdCapture(ctx));
+    this.bot.command("screen", async (ctx) => this.cmdScreen(ctx));
+    this.bot.command("clear", async (ctx) => this.cmdClearSession(ctx));
 
     this.bot.on("callback_query", async (ctx) => this.onCallback(ctx));
 
     this.bot.on("text", async (ctx) => this.onText(ctx));
+    this.bot.on("voice", async (ctx) => this.onVoice(ctx));
+    this.bot.on("audio", async (ctx) => this.onAudio(ctx));
+    this.bot.on("photo", async (ctx) => this.onPhoto(ctx));
+    this.bot.on("document", async (ctx) => this.onDocument(ctx));
 
     await this.bot.telegram.getMe();
     this.bot.launch().catch((err: unknown) => this.logger.error({ err }, "telegram launch error"));
@@ -370,9 +382,10 @@ export class TelegramAdapter implements InterfaceAdapter {
     const args = parseArgs(ctx);
     const arg = args[0];
     if (!arg) {
-      await ctx.reply("usage: `/resume <list-number | session-id-prefix>`", { parse_mode: "Markdown" });
+      await ctx.reply("usage: `/resume <list-number | session-id-prefix> [force]`", { parse_mode: "Markdown" });
       return;
     }
+    const force = (args[1] ?? "").toLowerCase() === "force";
 
     const [tracked, discovered] = await Promise.all([
       sessions.listSessions(),
@@ -404,6 +417,26 @@ export class TelegramAdapter implements InterfaceAdapter {
       }
       trackedSession = found;
     } else {
+      // Concurrency guard: a recently-modified JSONL is likely being written
+      // to by another claude process (e.g. open terminal). Resuming would
+      // give us two writers on the same file → corruption. Refuse unless
+      // the user explicitly passes "force".
+      if (!force) {
+        const ageMs = Date.now() - chosen.last_activity_at;
+        if (ageMs < 60_000) {
+          await ctx.reply(
+            [
+              `⚠️ Session \`${chosen.session_id.slice(0, 8)}\` was touched ${Math.round(ageMs / 1000)}s ago — looks like it might still be active in another terminal.`,
+              `Resuming now would create two writers on the same transcript file.`,
+              ``,
+              `If you're sure the other process is gone:`,
+              `\`/resume ${chosen.session_id.slice(0, 8)} force\``,
+            ].join("\n"),
+            { parse_mode: "Markdown" },
+          );
+          return;
+        }
+      }
       try {
         trackedSession = await sessions.resumeDiscoveredSession(chosen.session_id);
         resumedFromDisk = true;
@@ -492,6 +525,24 @@ export class TelegramAdapter implements InterfaceAdapter {
     await ctx.reply(`✓ voice mode = ${mode} (TTS ships in a follow-up commit)`);
   }
 
+  private async cmdClearSession(ctx: Context): Promise<void> {
+    const sessions = this.requireSessionService(ctx);
+    if (!sessions) return;
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    const state = await sessions.getChatState("telegram", String(chatId));
+    if (!state?.active_session_id) {
+      await ctx.reply("no active session.");
+      return;
+    }
+    try {
+      await sessions.sendInput(state.active_session_id, "/clear", true);
+      await ctx.reply(`✓ sent /clear to ${state.active_session_id.slice(0, 8)} — context wiped, session_id kept`);
+    } catch (err) {
+      await ctx.reply(`clear failed: ${(err as Error).message}`);
+    }
+  }
+
   private async cmdCapture(ctx: Context): Promise<void> {
     const sessions = this.requireSessionService(ctx);
     if (!sessions) return;
@@ -504,9 +555,36 @@ export class TelegramAdapter implements InterfaceAdapter {
     }
     try {
       const cap = await sessions.capturePane(state.active_session_id, { visibleOnly: true });
-      await ctx.reply(this.formatPaneOutput(cap.text), { parse_mode: "Markdown" });
+      const cleaned = cleanPaneText(cap.text);
+      if (cleaned) {
+        await this.safeReply(ctx, cleaned);
+      } else {
+        await ctx.reply("(pane is empty)");
+      }
     } catch (err) {
       await ctx.reply(`capture failed: ${(err as Error).message}`);
+    }
+  }
+
+  private async cmdScreen(ctx: Context): Promise<void> {
+    const sessions = this.requireSessionService(ctx);
+    if (!sessions) return;
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    const state = await sessions.getChatState("telegram", String(chatId));
+    if (!state?.active_session_id) {
+      await ctx.reply("no active session.");
+      return;
+    }
+    try {
+      // Get session label to show in the title bar of the screenshot.
+      const discovered = await sessions.getDiscoveredSession(state.active_session_id).catch(() => null);
+      const tracked = (await sessions.listSessions()).find((s) => s.session_id === state.active_session_id);
+      const label = tracked?.label ?? discovered?.agent_title ?? discovered?.ai_title ?? state.active_session_id.slice(0, 8);
+      const png = await sessions.screenshotPane(state.active_session_id, { label });
+      await ctx.replyWithPhoto({ source: png });
+    } catch (err) {
+      await ctx.reply(`screenshot failed: ${(err as Error).message}`);
     }
   }
 
@@ -591,29 +669,82 @@ export class TelegramAdapter implements InterfaceAdapter {
       await ctx.reply("no active session — try /new claude (or /list then /resume).");
       return;
     }
+    await this.deliverPromptAndStream(ctx, sessions, state.active_session_id, text);
+  }
+
+  /**
+   * Type `text` into a session's pane, hold a "typing..." indicator while the
+   * agent works, then reply with the response when it settles.
+   * Shared by `onText` and `onVoice`.
+   *
+   * Response priority:
+   *   1. last_assistant from the JSONL (clean markdown text, no TUI chrome)
+   *   2. cleaned visible pane output (fallback if JSONL isn't ready)
+   *
+   * `prefix` — optional text shown above the response (e.g. transcript echo).
+   * Combining them into one message avoids the "two separate messages" UX.
+   */
+  private async deliverPromptAndStream(
+    ctx: Context,
+    sessions: SessionService,
+    sessionId: string,
+    text: string,
+    prefix?: string,
+  ): Promise<void> {
     try {
-      await sessions.sendInput(state.active_session_id, text);
+      await sessions.sendInput(sessionId, text);
     } catch (err) {
-      await ctx.reply(`send failed: ${(err as Error).message}`);
+      const msg = (err as Error).message;
+      if (msg.includes("unknown session")) {
+        await ctx.reply(
+          "Session unreachable — it was lost when the worker restarted.\n" +
+          "Use /list then /resume to reconnect.",
+        );
+      } else {
+        await ctx.reply(`Could not send message: ${msg}`);
+      }
       return;
     }
-    // Keep "typing..." showing in Telegram while the agent works.
-    // sendChatAction expires after ~5s, so refresh every 4s until done.
-    const startTyping = () => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+
+    // Send a visible "working" message immediately so the user knows Claude is
+    // active even during a long response. We delete it when the reply arrives.
+    let workingMsgId: number | null = null;
+    try {
+      const m = await ctx.reply("⏳ Working...");
+      workingMsgId = m.message_id;
+    } catch { /* non-fatal */ }
+
+    // Also keep sending the chat "typing" action as a secondary signal.
+    const typingTimer = setInterval(() => {
       void ctx.telegram.sendChatAction(chatId, "typing").catch(() => {});
-    };
-    startTyping();
-    const typingTimer = setInterval(startTyping, 4000);
+    }, 4000);
     typingTimer.unref?.();
 
-    try {
-      const final = await this.waitForStablePane(sessions, state.active_session_id);
-      if (final.trim().length === 0) {
-        await ctx.reply("(no output captured — the pane is empty)");
-        return;
+    const deleteWorking = () => {
+      if (workingMsgId !== null) {
+        void ctx.telegram.deleteMessage(chatId, workingMsgId).catch(() => {});
+        workingMsgId = null;
       }
-      await ctx.reply(this.formatPaneOutput(final), { parse_mode: "Markdown" });
+    };
+
+    try {
+      const paneText = await this.waitForStablePane(sessions, sessionId);
+
+      // Primary: read the response from the JSONL — clean prose, no TUI chrome.
+      const meta = await sessions.getDiscoveredSession(sessionId).catch(() => null);
+      const responseText = meta?.last_assistant?.trim();
+      const body = responseText ?? cleanPaneText(paneText);
+      deleteWorking();
+      if (body) {
+        const full = prefix ? `${prefix}\n\n${body}` : body;
+        await this.deliverResponse(ctx, sessions, chatId, full);
+      } else {
+        await ctx.reply("(Claude is ready — send a message to get a response)");
+      }
     } catch (err) {
+      deleteWorking();
       await ctx.reply(`(could not capture response: ${(err as Error).message})`);
     } finally {
       clearInterval(typingTimer);
@@ -621,17 +752,129 @@ export class TelegramAdapter implements InterfaceAdapter {
   }
 
   /**
+   * Send a response text to the user. When voice mode is active, synthesizes
+   * to an OGG/Opus voice note. Falls back to text if TTS fails or isn't installed.
+   *
+   *  off  → text only
+   *  on   → voice note only
+   *  auto → voice note if ≤ 400 chars (conversational), text otherwise
+   */
+  private async deliverResponse(
+    ctx: Context,
+    sessions: SessionService,
+    chatId: number,
+    text: string,
+  ): Promise<void> {
+    const state = await sessions.getChatState("telegram", String(chatId)).catch(() => null);
+    const voiceMode = state?.voice_mode ?? "auto";
+    const wantVoice = voiceMode === "on" || (voiceMode === "auto" && text.length <= 400);
+
+    if (wantVoice) {
+      try {
+        const audio = await sessions.synthesizeText(text);
+        await ctx.telegram.sendVoice(chatId, { source: audio });
+        return;
+      } catch (err) {
+        this.logger.warn({ err }, "TTS failed; falling back to text reply");
+      }
+    }
+    await this.safeReply(ctx, text);
+  }
+
+  private async onVoice(ctx: Context): Promise<void> {
+    const voice = (ctx.message as { voice?: { file_id: string; mime_type?: string; duration?: number } } | undefined)?.voice;
+    if (!voice) return;
+    await this.handleAudioMessage(ctx, voice.file_id, voice.mime_type);
+  }
+
+  private async onAudio(ctx: Context): Promise<void> {
+    const audio = (ctx.message as { audio?: { file_id: string; mime_type?: string } } | undefined)?.audio;
+    if (!audio) return;
+    await this.handleAudioMessage(ctx, audio.file_id, audio.mime_type);
+  }
+
+  private async handleAudioMessage(ctx: Context, fileId: string, mimeType?: string): Promise<void> {
+    const sessions = this.handlers?.sessions;
+    if (!sessions) {
+      await ctx.reply("(session service unavailable)");
+      return;
+    }
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    const state = await sessions.getChatState("telegram", String(chatId));
+    if (!state?.active_session_id) {
+      await ctx.reply("no active session — /new claude (or /list then /resume) before sending voice.");
+      return;
+    }
+    // Show a quick acknowledgement while we transcribe.
+    void ctx.telegram.sendChatAction(chatId, "record_voice").catch(() => {});
+
+    let buffer: Buffer;
+    try {
+      const link = await ctx.telegram.getFileLink(fileId);
+      const res = await fetch(link.toString());
+      if (!res.ok) throw new Error(`telegram file fetch returned ${res.status}`);
+      buffer = Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      await ctx.reply(`could not download voice note: ${(err as Error).message}`);
+      return;
+    }
+
+    let text: string;
+    try {
+      const opts: { mimeType?: string } = {};
+      if (mimeType !== undefined) opts.mimeType = mimeType;
+      text = await sessions.transcribeAudio(buffer, opts);
+    } catch (err) {
+      const msg = (err as Error).message;
+      await ctx.reply(
+        msg.includes("install-models") || msg.includes("whisper") || msg.includes("ffmpeg")
+          ? `transcription unavailable: ${msg}\nRun: pnpm wazir:install-models`
+          : `transcription failed: ${msg}`,
+      );
+      return;
+    }
+    if (!text.trim()) {
+      await ctx.reply("(transcription returned empty — too short or silent?)");
+      return;
+    }
+    // Transcript echo is always plain text, regardless of voice mode.
+    await ctx.reply(`🎙 "${text.trim()}"`);
+    // Claude's response is delivered separately and goes through the normal
+    // voice mode check (text, voice note, or auto depending on /voice setting).
+    await this.deliverPromptAndStream(ctx, sessions, state.active_session_id, text.trim());
+  }
+
+  /**
    * Poll the session's visible pane until two consecutive captures are
    * byte-identical, then return that snapshot. Caps at maxWaitMs.
+   *
+   * Two-phase:
+   *   1. Wait for pane to change from its pre-response baseline (Claude starts).
+   *   2. Wait for pane to stabilize (2 identical consecutive captures = done).
+   *
+   * Without phase 1, the pane looks stable during Claude's "thinking" pause
+   * and we'd return before the response actually appears.
    */
   private async waitForStablePane(
     sessions: SessionService,
     sessionId: string,
   ): Promise<string> {
     const start = Date.now();
+    let lastSeen = "";
     let previous: string | null = null;
     let stableCount = 0;
-    let lastSeen = "";
+
+    // Capture baseline so we know what the pane looked like before the response.
+    let baseline: string | null = null;
+    try {
+      const initial = await sessions.capturePane(sessionId, { visibleOnly: true });
+      baseline = initial.text;
+    } catch { /* if initial capture fails, skip phase 1 */ }
+
+    // Phase 1 is done when we see a change from baseline (or if baseline capture failed).
+    let activitySeen = baseline === null;
+
     while (Date.now() - start < this.maxWaitMs) {
       await new Promise((r) => setTimeout(r, this.pollIntervalMs));
       let cap;
@@ -642,6 +885,18 @@ export class TelegramAdapter implements InterfaceAdapter {
         continue;
       }
       lastSeen = cap.text;
+
+      // Phase 1: wait until the pane differs from baseline (Claude started responding).
+      if (!activitySeen) {
+        if (cap.text !== baseline) {
+          activitySeen = true;
+          previous = cap.text;
+          stableCount = 0;
+        }
+        continue;
+      }
+
+      // Phase 2: wait for the pane to stabilize.
       if (cap.text === previous) {
         stableCount += 1;
         if (stableCount >= this.stableTicks) return cap.text;
@@ -652,6 +907,65 @@ export class TelegramAdapter implements InterfaceAdapter {
     }
     // Timed out — return whatever we last saw so the user gets something useful.
     return lastSeen;
+  }
+
+  private async onPhoto(ctx: Context): Promise<void> {
+    const photos = (ctx.message as { photo?: Array<{ file_id: string; width: number; height: number }> } | undefined)?.photo;
+    if (!photos || photos.length === 0) return;
+    const largest = photos[photos.length - 1];
+    if (!largest) return;
+    const caption = (ctx.message as { caption?: string } | undefined)?.caption;
+    await this.handleImageMessage(ctx, largest.file_id, ".jpg", caption);
+  }
+
+  private async onDocument(ctx: Context): Promise<void> {
+    const doc = (ctx.message as { document?: { file_id: string; mime_type?: string; file_name?: string } } | undefined)?.document;
+    if (!doc) return;
+    const mime = doc.mime_type ?? "";
+    if (!mime.startsWith("image/")) return;
+    const ext = mimeToExt(mime);
+    const caption = (ctx.message as { caption?: string } | undefined)?.caption;
+    await this.handleImageMessage(ctx, doc.file_id, ext, caption);
+  }
+
+  private async handleImageMessage(
+    ctx: Context,
+    fileId: string,
+    ext: string,
+    caption: string | undefined,
+  ): Promise<void> {
+    const sessions = this.handlers?.sessions;
+    if (!sessions) { await ctx.reply("(session service unavailable)"); return; }
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    const state = await sessions.getChatState("telegram", String(chatId));
+    if (!state?.active_session_id) {
+      await ctx.reply("no active session — /new claude (or /list then /resume) before sending images.");
+      return;
+    }
+
+    let buffer: Buffer;
+    try {
+      const link = await ctx.telegram.getFileLink(fileId);
+      const res = await fetch(link.toString());
+      if (!res.ok) throw new Error(`telegram file fetch returned ${res.status}`);
+      buffer = Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      await ctx.reply(`could not download image: ${(err as Error).message}`);
+      return;
+    }
+
+    const tmpDir = resolve(homedir(), ".wazir", "tmp");
+    mkdirSync(tmpDir, { recursive: true });
+    const filePath = join(tmpDir, `wazir-${randomUUID()}${ext}`);
+    writeFileSync(filePath, buffer);
+
+    // Tell the user where it landed, then deliver to the session.
+    await ctx.reply(`📎 ${filePath}`);
+    const message = caption
+      ? `[image: ${filePath}]\n${caption}`
+      : `[image: ${filePath}]`;
+    await this.deliverPromptAndStream(ctx, sessions, state.active_session_id, message);
   }
 
   // ----------------------------------------------------------------
@@ -683,15 +997,8 @@ export class TelegramAdapter implements InterfaceAdapter {
     }
   }
 
-  private formatPaneOutput(text: string): string {
-    const trimmed = text.replace(/\s+$/g, "");
-    // collapse runs of >2 blank lines so terminal whitespace doesn't dominate
-    const collapsed = trimmed.replace(/\n{3,}/g, "\n\n");
-    const max = 3500;
-    const body = collapsed.length > max ? `…\n${collapsed.slice(-max)}` : collapsed;
-    return "```\n" + body + "\n```";
-  }
 }
+
 
 function mergeListEntries(
   tracked: Session[],
@@ -805,4 +1112,60 @@ function truncate(s: string, max: number): string {
 
 function escapeMd(s: string): string {
   return s.replace(/([_*`\[\]])/g, "\\$1");
+}
+
+function mimeToExt(mime: string): string {
+  const map: Record<string, string> = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+  };
+  return map[mime] ?? ".jpg";
+}
+
+/**
+ * Strip TUI chrome from a raw tmux pane capture so the output reads like
+ * a normal conversation instead of a terminal screenshot.
+ *
+ * Removes: ANSI escape sequences, box-drawing border lines, the Claude
+ * status bar ("N tokens · esc to interrupt"), and collapses excessive
+ * blank lines.
+ */
+function cleanPaneText(raw: string): string {
+  // Strip ANSI escape sequences (color, cursor movement, etc.)
+  // eslint-disable-next-line no-control-regex
+  const stripped = raw.replace(/\x1b\[[\d;]*[A-Za-z]/g, "").replace(/\x1b[()][AB012]/g, "");
+
+  const lines = stripped.split("\n");
+  const cleaned: string[] = [];
+  for (const line of lines) {
+    const t = line.trimEnd();
+    // Skip lines that are purely box-drawing / border chrome
+    if (!t || /^[\s╭╰╮╯│─┤├┼┘└┐┌]+$/.test(t)) continue;
+    // Skip the Claude status bar: "Claude ●  42 tokens · esc to interrupt"
+    if (/\d+\s*tokens?\b/i.test(t) && /esc\s+to\s+interrupt/i.test(t)) continue;
+    // Skip bare "esc to interrupt" lines
+    if (/^\s*esc\s+to\s+interrupt\s*$/i.test(t)) continue;
+    cleaned.push(t);
+  }
+
+  // Collapse runs of blank lines to a single blank
+  const result: string[] = [];
+  let prevBlank = false;
+  for (const line of cleaned) {
+    if (line === "") {
+      if (!prevBlank) result.push("");
+      prevBlank = true;
+    } else {
+      prevBlank = false;
+      result.push(line);
+    }
+  }
+  while (result.length > 0 && result[0] === "") result.shift();
+  while (result.length > 0 && result[result.length - 1] === "") result.pop();
+
+  return result.join("\n");
 }

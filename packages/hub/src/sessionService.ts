@@ -5,6 +5,8 @@ import {
   SessionSchema,
   SessionCaptureSchema,
   DiscoveredSessionSchema,
+  TranscribeResponseSchema,
+  SynthesizeResponseSchema,
   type ChatState,
   type DiscoveredSession,
   type Session,
@@ -210,6 +212,55 @@ export class HubSessionService implements SessionService {
     } else {
       this.labels.set(sessionId, trimmed, Date.now());
     }
+  }
+
+  async transcribeAudio(
+    audio: Buffer,
+    opts: { mimeType?: string; language?: string } = {},
+  ): Promise<string> {
+    const worker = this.workers.listWorkers()[0];
+    if (!worker || !worker.worker_url) throw new Error("no worker available for transcription");
+    const body: Record<string, unknown> = { audio_base64: audio.toString("base64") };
+    if (opts.mimeType !== undefined) body.mime_type = opts.mimeType;
+    if (opts.language !== undefined) body.language = opts.language;
+    const res = await this.callWorker(worker.worker_url, "POST", "/v1/transcribe", body);
+    if (res.status !== 200) {
+      throw new Error(`worker transcription failed: ${res.status} ${stringifyBody(res.body)}`);
+    }
+    const parsed = TranscribeResponseSchema.parse(res.body);
+    return parsed.text;
+  }
+
+  async synthesizeText(text: string): Promise<Buffer> {
+    const worker = this.workers.listWorkers()[0];
+    if (!worker || !worker.worker_url) throw new Error("no worker available for synthesis");
+    const res = await this.callWorker(worker.worker_url, "POST", "/v1/synthesize", { text });
+    if (res.status !== 200) {
+      throw new Error(`worker synthesis failed: ${res.status} ${stringifyBody(res.body)}`);
+    }
+    const parsed = SynthesizeResponseSchema.parse(res.body);
+    return Buffer.from(parsed.audio_base64, "base64");
+  }
+
+  async screenshotPane(sessionId: string, opts: { label?: string } = {}): Promise<Buffer> {
+    const row = this.sessions.get(sessionId);
+    if (!row) throw new Error(`unknown session: ${sessionId}`);
+    const worker = this.workers.getWorker(row.worker_id);
+    if (!worker?.worker_url) throw new Error(`worker unavailable for session ${sessionId}`);
+    const params = new URLSearchParams();
+    if (opts.label) params.set("label", opts.label);
+    const qs = params.toString() ? `?${params}` : "";
+    const url = `${worker.worker_url}/v1/sessions/${encodeURIComponent(sessionId)}/screenshot${qs}`;
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = signPayload(this.hmacSecret, "", ts);
+    const res = await fetch(url, {
+      headers: {
+        [HMAC_HEADER_SIGNATURE]: sig,
+        [HMAC_HEADER_TIMESTAMP]: String(ts),
+      },
+    });
+    if (!res.ok) throw new Error(`worker screenshot failed: ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
   }
 
   private async callWorker(

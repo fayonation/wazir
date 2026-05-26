@@ -11,13 +11,16 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.0",
     "@wazir/protocol": "workspace:*",
     "express": "^4.21.2",
     "pino": "^9.5.0",

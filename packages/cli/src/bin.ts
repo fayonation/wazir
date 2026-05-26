@@ -9,6 +9,7 @@ import { runWorker } from "./commands/worker.js";
 import { runStatus } from "./commands/status.js";
 import { runLog } from "./commands/log.js";
 import { runDoctor } from "./commands/doctor.js";
+import { runInstallModels } from "./commands/installModels.js";
 import {
   runInstallService,
   runUninstallService,
@@ -74,6 +75,13 @@ program
   .description("Run a health check (Node version, config, hub, worker, Telegram, hook).")
   .action(async () => {
     await runDoctor();
+  });
+
+program
+  .command("install-models")
+  .description("Install local STT dependencies (whisper.cpp via brew + base.en model).")
+  .action(async () => {
+    await runInstallModels();
   });
 
 const session = program.command("session").description("Manage agent sessions (tmux-backed).");

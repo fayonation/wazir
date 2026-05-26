@@ -195,6 +195,41 @@ export class TmuxManager {
     this.tracked.clear();
   }
 
+  /**
+   * Re-register any live wazir-* tmux sessions that aren't already tracked.
+   * Called on startup so a worker restart doesn't orphan sessions that tmux
+   * is still running. Returns the count of newly registered sessions.
+   */
+  async rehydrate(): Promise<number> {
+    const live = await listLiveTmuxSessions();
+    let count = 0;
+    for (const s of live) {
+      // Name format: wazir-{agent}-{uuid}  (uuid is always 36 chars: 8-4-4-4-12)
+      const withoutPrefix = s.name.slice(TMUX_NAME_PREFIX.length);
+      if (withoutPrefix.length < 37) continue;
+      const uuidStart = withoutPrefix.length - 36;
+      if (withoutPrefix[uuidStart - 1] !== "-") continue;
+      const sessionId = withoutPrefix.slice(uuidStart);
+      const agent = withoutPrefix.slice(0, uuidStart - 1);
+      if (!sessionId || !agent) continue;
+      if (this.tracked.has(sessionId)) continue;
+      const session: Session = {
+        session_id: sessionId,
+        worker_id: this.workerId,
+        agent,
+        cwd: s.cwd || (process.env.HOME ?? "/"),
+        tmux_name: s.name,
+        status: "running",
+        created_at: s.createdAt,
+        last_activity_at: s.createdAt,
+      };
+      this.tracked.set(sessionId, { session, paneCursor: 0 });
+      count++;
+      this.logger.info({ session_id: sessionId, tmux_name: s.name, agent }, "rehydrated session from live tmux");
+    }
+    return count;
+  }
+
   /** Forget a single session without killing tmux. Used when reconciliation finds it gone. */
   forget(sessionId: string): void {
     this.tracked.delete(sessionId);
@@ -228,23 +263,30 @@ function quoteForShell(s: string): string {
 interface LiveTmuxSession {
   name: string;
   createdAt: number;
+  cwd: string;
 }
 
 async function listLiveTmuxSessions(): Promise<LiveTmuxSession[]> {
   try {
-    const { stdout } = await tmux(["list-sessions", "-F", "#{session_name}|#{session_created}"]);
+    // list-panes -a gives one row per pane; use the first pane per session for the cwd.
+    const { stdout } = await tmux(["list-panes", "-a", "-F", "#{session_name}|#{session_created}|#{pane_current_path}"]);
+    const seen = new Set<string>();
     const out: LiveTmuxSession[] = [];
     for (const raw of stdout.split("\n")) {
       const line = raw.trim();
       if (!line) continue;
-      const [name, createdStr] = line.split("|");
+      const parts = line.split("|");
+      const name = parts[0] ?? "";
+      const createdStr = parts[1] ?? "";
+      const cwd = parts[2] ?? "";
       if (!name || !name.startsWith(TMUX_NAME_PREFIX)) continue;
+      if (seen.has(name)) continue;
+      seen.add(name);
       const createdAt = createdStr ? Number.parseInt(createdStr, 10) * 1000 : Date.now();
-      out.push({ name, createdAt });
+      out.push({ name, createdAt, cwd });
     }
     return out;
   } catch {
-    // no sessions
     return [];
   }
 }

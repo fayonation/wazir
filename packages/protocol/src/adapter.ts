@@ -86,4 +86,23 @@ export interface SessionService {
    * Pass an empty/whitespace string to clear.
    */
   setSessionLabel(sessionId: string, label: string): Promise<void>;
+
+  /**
+   * Transcribe an audio buffer to text via the worker's local whisper.cpp.
+   * Throws if dependencies (whisper binary or model file) are missing.
+   */
+  transcribeAudio(audio: Buffer, opts?: { mimeType?: string; language?: string }): Promise<string>;
+
+  /**
+   * Synthesize text to speech via the worker's local piper TTS.
+   * Returns an OGG/Opus audio buffer ready to send as a Telegram voice note.
+   * Throws if piper binary or voice model are missing.
+   */
+  synthesizeText(text: string): Promise<Buffer>;
+
+  /**
+   * Render the active session's visible pane as a PNG screenshot.
+   * Returns a raw PNG buffer ready to send as a Telegram photo.
+   */
+  screenshotPane(sessionId: string, opts?: { label?: string }): Promise<Buffer>;
 }

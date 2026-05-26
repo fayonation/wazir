@@ -5,3 +5,5 @@ export { readModelFromTranscript, extractLatestModel, prettyModel } from "./tran
 export { TmuxManager, TmuxError } from "./tmux/index.js";
 export type { SpawnOptions as TmuxSpawnOptions, CaptureResult as TmuxCaptureResult } from "./tmux/index.js";
 export { discoverClaudeSessions, findClaudeSession } from "./discovery/claude.js";
+export { transcribe, findWhisperBin, findFfmpegBin } from "./transcription/index.js";
+export type { TranscribeOptions, TranscribeResult } from "./transcription/index.js";

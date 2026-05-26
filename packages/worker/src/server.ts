@@ -6,6 +6,8 @@ import {
   ApprovalDecisionCallbackSchema,
   SessionSpawnRequestSchema,
   SessionInputRequestSchema,
+  TranscribeRequestSchema,
+  SynthesizeRequestSchema,
   type RiskPattern,
 } from "@wazir/protocol";
 import { createHmacMiddleware, rawBodyCapture, type RawBodyRequest } from "./hmacMiddleware.js";
@@ -21,6 +23,9 @@ import { createLogger, type WorkerLogger } from "./logger.js";
 import { readModelFromTranscript, prettyModel } from "./transcript.js";
 import { TmuxManager } from "./tmux/index.js";
 import { discoverClaudeSessions, findClaudeSession } from "./discovery/claude.js";
+import { transcribe } from "./transcription/index.js";
+import { synthesize } from "./tts/index.js";
+import { renderPanePng } from "./screenshot/index.js";
 
 export interface WorkerStartOptions {
   workerId: string;
@@ -55,6 +60,10 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
   const approvalTimeoutSeconds = opts.approvalTimeoutSeconds ?? 540;
   const pendingDecisions = new Map<string, PendingDecision>();
   const tmuxManager = new TmuxManager(logger, opts.workerId);
+  const rehydrated = await tmuxManager.rehydrate();
+  if (rehydrated > 0) {
+    logger.info({ count: rehydrated }, "rehydrated existing tmux sessions after worker restart");
+  }
   const workerUrl = `http://${opts.bindHost}:${opts.bindPort}`;
 
   await hubClient.register({
@@ -250,6 +259,20 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
     }
   });
 
+  app.get("/v1/sessions/:session_id/screenshot", hmac, async (req: RawBodyRequest, res: Response) => {
+    const sessionId = req.params.session_id;
+    if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
+    const label = typeof req.query.label === "string" ? req.query.label : undefined;
+    try {
+      const capture = await tmuxManager.capturePane(sessionId, { visibleOnly: true });
+      const png = renderPanePng(capture.text, label);
+      res.set("content-type", "image/png");
+      res.send(png);
+    } catch (err) {
+      res.status(500).json({ error: "screenshot_failed", detail: (err as Error).message });
+    }
+  });
+
   app.delete("/v1/sessions/:session_id", hmac, async (req: RawBodyRequest, res: Response) => {
     const sessionId = req.params.session_id;
     if (!sessionId) { res.status(400).json({ error: "missing_session_id" }); return; }
@@ -279,6 +302,54 @@ export async function startWorker(opts: WorkerStartOptions): Promise<WorkerHandl
       return;
     }
     res.json(found);
+  });
+
+  app.post("/v1/transcribe", hmac, async (req: RawBodyRequest, res: Response) => {
+    const parsed = TranscribeRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_body", details: parsed.error.flatten() });
+      return;
+    }
+    let audio: Buffer;
+    try {
+      audio = Buffer.from(parsed.data.audio_base64, "base64");
+    } catch {
+      res.status(400).json({ error: "invalid_base64" });
+      return;
+    }
+    if (audio.length === 0) {
+      res.status(400).json({ error: "empty_audio" });
+      return;
+    }
+    try {
+      const transcribeOpts: Parameters<typeof transcribe>[1] = {};
+      if (parsed.data.language !== undefined) transcribeOpts.language = parsed.data.language;
+      const result = await transcribe(audio, transcribeOpts);
+      logger.info(
+        { duration_ms: result.durationMs, audio_bytes: audio.length, chars: result.text.length },
+        "transcription complete",
+      );
+      res.json({ text: result.text, duration_ms: result.durationMs });
+    } catch (err) {
+      logger.error({ err }, "transcription failed");
+      res.status(500).json({ error: "transcription_failed", detail: (err as Error).message });
+    }
+  });
+
+  app.post("/v1/synthesize", hmac, async (req: RawBodyRequest, res: Response) => {
+    const parsed = SynthesizeRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_body", details: parsed.error.flatten() });
+      return;
+    }
+    try {
+      const result = await synthesize(parsed.data.text);
+      logger.info({ duration_ms: result.durationMs, bytes: result.audio.length }, "synthesis complete");
+      res.json({ audio_base64: result.audio.toString("base64"), duration_ms: result.durationMs });
+    } catch (err) {
+      logger.error({ err }, "synthesis failed");
+      res.status(500).json({ error: "synthesis_failed", detail: (err as Error).message });
+    }
   });
 
   app.post("/v1/decisions/:request_id", hmac, (req: RawBodyRequest, res: Response) => {

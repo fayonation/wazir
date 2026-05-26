@@ -58,6 +58,40 @@ export const SessionReportSchema = z.object({
 export type SessionReport = z.infer<typeof SessionReportSchema>;
 
 /**
+ * Transcription request body — base64-encoded audio (any container ffmpeg can
+ * read; Telegram delivers ogg/opus). Base64 over JSON keeps HMAC signing simple
+ * for binary payloads in Phase 2.
+ */
+export const TranscribeRequestSchema = z.object({
+  audio_base64: z.string().min(1),
+  mime_type: z.string().optional(),
+  language: z.string().optional(),
+});
+
+export type TranscribeRequest = z.infer<typeof TranscribeRequestSchema>;
+
+export const TranscribeResponseSchema = z.object({
+  text: z.string(),
+  duration_ms: z.number().int().nonnegative(),
+});
+
+export type TranscribeResponse = z.infer<typeof TranscribeResponseSchema>;
+
+export const SynthesizeRequestSchema = z.object({
+  text: z.string().min(1).max(5000),
+  voice: z.string().optional(),
+});
+
+export type SynthesizeRequest = z.infer<typeof SynthesizeRequestSchema>;
+
+export const SynthesizeResponseSchema = z.object({
+  audio_base64: z.string().min(1),
+  duration_ms: z.number().int().nonnegative(),
+});
+
+export type SynthesizeResponse = z.infer<typeof SynthesizeResponseSchema>;
+
+/**
  * A session found on disk by enumerating an agent's persisted state.
  * For Claude Code this is `~/.claude/projects/<encoded-cwd>/<id>.jsonl`.
  * These represent conversations that can be RESUMED — they may or may
