@@ -48,7 +48,10 @@ function buildSpecs(): { hub: LaunchAgentSpec; worker: LaunchAgentSpec } {
   ensureLogDir(workerLog);
 
   const sharedEnv: Record<string, string> = {
-    PATH: `${dirname(node)}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`,
+    // Include ~/.local/bin because that's where Claude Code installs the
+    // `claude` binary by default. Without it the worker can't spawn the
+    // print-mode runner ("spawn claude ENOENT").
+    PATH: `${homedir()}/.local/bin:${dirname(node)}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`,
     HOME: homedir(),
   };
 

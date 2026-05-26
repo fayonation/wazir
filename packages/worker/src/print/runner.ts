@@ -5,6 +5,37 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 
 /**
+ * Locate the `claude` binary. PATH-first; falls back to a handful of
+ * standard install locations because launchd-spawned daemons often have
+ * a minimal PATH that doesn't include `~/.local/bin`, which is where the
+ * Claude Code installer puts the binary by default.
+ *
+ * Memoized — resolved once per worker process.
+ */
+let cachedClaudePath: string | null = null;
+function resolveClaudeBinary(): string {
+  if (cachedClaudePath) return cachedClaudePath;
+  // Honour an explicit override first.
+  const override = process.env.WAZIR_CLAUDE_BIN;
+  if (override && existsSync(override)) { cachedClaudePath = override; return override; }
+  // Try common locations in order. Each is the place Claude Code's
+  // installer / brew / volta / nvm typically drops the symlink.
+  const candidates = [
+    join(homedir(), ".local", "bin", "claude"),
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+    "/usr/bin/claude",
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) { cachedClaudePath = c; return c; }
+  }
+  // Fall back to letting the shell resolve via PATH — caller will see
+  // a clean ENOENT if it's really missing.
+  cachedClaudePath = "claude";
+  return "claude";
+}
+
+/**
  * Drives one non-interactive Claude Code turn via `claude --print`.
  *
  * This replaces the tmux send-keys + JSONL-polling approach used by the
@@ -75,7 +106,8 @@ export async function runPrintTurn(opts: PrintTurnOptions): Promise<PrintTurnRes
     opts.prompt,
   ];
 
-  const child = spawn("claude", args, {
+  const claudeBin = resolveClaudeBinary();
+  const child = spawn(claudeBin, args, {
     cwd: opts.cwd,
     env: { ...process.env, CI: "1" },
     stdio: ["ignore", "pipe", "pipe"],
