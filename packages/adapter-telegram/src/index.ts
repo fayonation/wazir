@@ -74,11 +74,13 @@ const HELP_TEXT = `*Wazir commands*
 \`/new [agent]\` — spawn a session (default: claude)
 \`/list\` — list all sessions (tracked + on-disk)
 \`/resume <n|id> [force]\` — switch active session (resumes from disk if needed). Add \`force\` to override the "session looks active elsewhere" guard.
+\`/switch <description>\` — fuzzy-match a session by free text (e.g. \`/switch auth refactor\`)
 \`/rename <n|id> <name>\` — name a session (empty name to clear)
 \`/cwd <path>\` — set this chat's sticky cwd
 \`/end\` — kill the active session
 \`/clear\` — wipe the active session's context (types /clear into the pane)
 \`/voice on|off|auto\` — voice reply mode
+\`/say <text>\` — speak arbitrary text as a voice note
 \`/capture\` — re-read the active session's pane (text)
 \`/screen\` — screenshot the active session's pane (image)
 \`/whoami\` — show your Telegram ids
@@ -145,10 +147,12 @@ export class TelegramAdapter implements InterfaceAdapter {
     this.bot.command("new", async (ctx) => this.cmdNew(ctx));
     this.bot.command("list", async (ctx) => this.cmdList(ctx));
     this.bot.command("resume", async (ctx) => this.cmdResume(ctx));
+    this.bot.command("switch", async (ctx) => this.cmdSwitch(ctx));
     this.bot.command("rename", async (ctx) => this.cmdRename(ctx));
     this.bot.command("cwd", async (ctx) => this.cmdCwd(ctx));
     this.bot.command("end", async (ctx) => this.cmdEnd(ctx));
     this.bot.command("voice", async (ctx) => this.cmdVoice(ctx));
+    this.bot.command("say", async (ctx) => this.cmdSay(ctx));
     this.bot.command("capture", async (ctx) => this.cmdCapture(ctx));
     this.bot.command("screen", async (ctx) => this.cmdScreen(ctx));
     this.bot.command("clear", async (ctx) => this.cmdClearSession(ctx));
@@ -411,10 +415,26 @@ export class TelegramAdapter implements InterfaceAdapter {
       return;
     }
 
+    await this.applySessionSwitch(ctx, sessions, chatId, chosen, tracked, force);
+  }
+
+  /**
+   * Make `entry` the active session for this chat. Handles the concurrency
+   * guard for discovered sessions and posts the same /resume summary.
+   * Shared by /resume and /switch.
+   */
+  private async applySessionSwitch(
+    ctx: Context,
+    sessions: SessionService,
+    chatId: number,
+    entry: ListEntry,
+    tracked: Session[],
+    force: boolean,
+  ): Promise<void> {
     let trackedSession: Session;
     let resumedFromDisk = false;
-    if (chosen.kind === "tracked") {
-      const found = tracked.find((s) => s.session_id === chosen!.session_id);
+    if (entry.kind === "tracked") {
+      const found = tracked.find((s) => s.session_id === entry.session_id);
       if (!found) {
         await ctx.reply("internal error: tracked session vanished between list and resume");
         return;
@@ -426,15 +446,15 @@ export class TelegramAdapter implements InterfaceAdapter {
       // give us two writers on the same file → corruption. Refuse unless
       // the user explicitly passes "force".
       if (!force) {
-        const ageMs = Date.now() - chosen.last_activity_at;
+        const ageMs = Date.now() - entry.last_activity_at;
         if (ageMs < 60_000) {
           await ctx.reply(
             [
-              `⚠️ Session \`${chosen.session_id.slice(0, 8)}\` was touched ${Math.round(ageMs / 1000)}s ago — looks like it might still be active in another terminal.`,
+              `⚠️ Session \`${entry.session_id.slice(0, 8)}\` was touched ${Math.round(ageMs / 1000)}s ago — looks like it might still be active in another terminal.`,
               `Resuming now would create two writers on the same transcript file.`,
               ``,
               `If you're sure the other process is gone:`,
-              `\`/resume ${chosen.session_id.slice(0, 8)} force\``,
+              `\`/resume ${entry.session_id.slice(0, 8)} force\``,
             ].join("\n"),
             { parse_mode: "Markdown" },
           );
@@ -442,7 +462,7 @@ export class TelegramAdapter implements InterfaceAdapter {
         }
       }
       try {
-        trackedSession = await sessions.resumeDiscoveredSession(chosen.session_id);
+        trackedSession = await sessions.resumeDiscoveredSession(entry.session_id);
         resumedFromDisk = true;
       } catch (err) {
         await ctx.reply(`resume failed: ${(err as Error).message}`);
@@ -457,6 +477,67 @@ export class TelegramAdapter implements InterfaceAdapter {
 
     const summary = await this.formatResumeSummary(sessions, trackedSession, resumedFromDisk);
     await ctx.reply(summary, { parse_mode: "Markdown" });
+  }
+
+  private async cmdSwitch(ctx: Context): Promise<void> {
+    const sessions = this.requireSessionService(ctx);
+    if (!sessions) return;
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    const raw = (ctx.message as Message.TextMessage).text;
+    const query = raw.replace(/^\/switch(?:@\S+)?\s*/, "").trim();
+    if (!query) {
+      await ctx.reply(
+        "usage: `/switch <natural-language description>`\nexamples: `/switch auth refactor`, `/switch back to the redis migration`",
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
+    const [tracked, discovered] = await Promise.all([
+      sessions.listSessions(),
+      sessions.listDiscoveredSessions(),
+    ]);
+    const entries = mergeListEntries(tracked, discovered);
+    if (entries.length === 0) {
+      await ctx.reply("(no sessions to switch to — /new to spawn one)");
+      return;
+    }
+
+    const ranked = rankSessionsByQuery(query, entries);
+    const best = ranked[0];
+
+    // Decision: clear winner if its score is meaningfully ahead of the
+    // runner-up. Otherwise show the top candidates and let the user
+    // /resume the right one.
+    const runnerUp = ranked[1];
+    const clearWinner =
+      best && best.score >= 2 && (!runnerUp || best.score >= runnerUp.score + 2);
+
+    if (clearWinner) {
+      await this.applySessionSwitch(ctx, sessions, chatId, best.entry, tracked, false);
+      return;
+    }
+
+    const candidates = ranked.filter((r) => r.score > 0).slice(0, 3);
+    if (candidates.length === 0) {
+      await ctx.reply(
+        `no sessions matched "${escapeMd(query)}". /list to see them all.`,
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+    const orderedIds = candidates.map((c) => c.entry.session_id);
+    this.lastListByChat.set(chatId, orderedIds);
+
+    const lines = [`Several matches for "${escapeMd(query)}" — pick one:`, ""];
+    for (const [i, c] of candidates.entries()) {
+      const { text: titleText } = resolveTitle(c.entry);
+      const snippet = c.entry.first_message ? ` _"${escapeMd(truncate(c.entry.first_message, 60))}"_` : "";
+      lines.push(`*${i + 1}.* ${escapeMd(truncate(titleText, 50))}${snippet}`);
+      lines.push(`   \`/resume ${i + 1}\` · ${formatRelative(c.entry.last_activity_at)}`);
+    }
+    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
   }
 
   private async formatResumeSummary(
@@ -526,7 +607,30 @@ export class TelegramAdapter implements InterfaceAdapter {
       return;
     }
     await sessions.setChatState("telegram", String(chatId), { voice_mode: mode });
-    await ctx.reply(`✓ voice mode = ${mode} (TTS ships in a follow-up commit)`);
+    const desc =
+      mode === "on" ? "all replies as voice notes" :
+      mode === "off" ? "all replies as text" :
+      "voice for short replies, text for long";
+    await ctx.reply(`✓ voice mode = ${mode} (${desc})`);
+  }
+
+  private async cmdSay(ctx: Context): Promise<void> {
+    const sessions = this.requireSessionService(ctx);
+    if (!sessions) return;
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    const raw = (ctx.message as Message.TextMessage).text;
+    const text = raw.replace(/^\/say(?:@\S+)?\s*/, "").trim();
+    if (!text) {
+      await ctx.reply("usage: /say <text> — synthesizes the text as a voice note");
+      return;
+    }
+    try {
+      const audio = await sessions.synthesizeText(text);
+      await ctx.telegram.sendVoice(chatId, { source: audio });
+    } catch (err) {
+      await ctx.reply(`tts failed: ${(err as Error).message}`);
+    }
   }
 
   private async cmdClearSession(ctx: Context): Promise<void> {
@@ -1248,6 +1352,58 @@ function truncate(s: string, max: number): string {
 
 function escapeMd(s: string): string {
   return s.replace(/([_*`\[\]])/g, "\\$1");
+}
+
+/**
+ * Score every session in `entries` against the user's free-text query
+ * and return them ranked best-first.
+ *
+ * Scoring: tokenize the query into content words (drop stop words and
+ * common navigation verbs like "switch"/"back"/"to"), then count how
+ * many tokens appear in each session's searchable text. Title/label
+ * matches count double — those are the user's deliberate names.
+ */
+function rankSessionsByQuery(
+  query: string,
+  entries: ListEntry[],
+): Array<{ entry: ListEntry; score: number }> {
+  const tokens = tokenizeQuery(query);
+  if (tokens.length === 0) return entries.map((entry) => ({ entry, score: 0 }));
+
+  const ranked = entries.map((entry) => {
+    const titleBag = [entry.label, entry.agent_title, entry.ai_title]
+      .filter((s): s is string => !!s)
+      .join(" ")
+      .toLowerCase();
+    const bodyBag = [entry.first_message, entry.cwd]
+      .filter((s): s is string => !!s)
+      .join(" ")
+      .toLowerCase();
+    let score = 0;
+    for (const tok of tokens) {
+      if (titleBag.includes(tok)) score += 2;
+      else if (bodyBag.includes(tok)) score += 1;
+    }
+    return { entry, score };
+  });
+  ranked.sort((a, b) => b.score - a.score || b.entry.last_activity_at - a.entry.last_activity_at);
+  return ranked;
+}
+
+const QUERY_STOPWORDS = new Set([
+  "a", "an", "the", "to", "of", "in", "on", "at", "for", "by", "with",
+  "and", "or", "but", "if", "is", "are", "was", "were", "be", "been",
+  "me", "my", "i", "you", "your", "we", "our", "it", "this", "that",
+  "these", "those", "go", "back", "switch", "resume", "open", "show",
+  "take", "into", "about", "convo", "conversation", "session", "session_id",
+  "please", "pls",
+]);
+
+function tokenizeQuery(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/[^a-z0-9_-]+/)
+    .filter((t) => t.length >= 2 && !QUERY_STOPWORDS.has(t));
 }
 
 function mimeToExt(mime: string): string {
