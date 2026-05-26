@@ -92,6 +92,9 @@ export class TelegramAdapter implements InterfaceAdapter {
   private readonly pending = new Map<string, PendingApproval>();
   private readonly modifyContext = new Map<string, string>(); // `${chatId}:${userId}` -> approvalId
   private readonly lastListByChat = new Map<number, string[]>(); // chatId -> ordered session_ids
+  // Per-session in-flight delivery; new messages chain off this so we don't
+  // race two pollers on the same pane.
+  private readonly inflightBySession = new Map<string, Promise<void>>();
   private readonly allowlist: Set<number>;
   private readonly maxCommandChars: number;
   private readonly defaultCwd: string;
@@ -106,7 +109,7 @@ export class TelegramAdapter implements InterfaceAdapter {
     this.defaultCwd = opts.defaultCwd ?? process.env.HOME ?? "/";
     this.pollIntervalMs = opts.pollIntervalMs ?? 1500;
     this.stableTicks = opts.stableTicks ?? 2;
-    this.maxWaitMs = opts.maxWaitMs ?? 45_000;
+    this.maxWaitMs = opts.maxWaitMs ?? 180_000;
     this.logger = opts.logger ?? NOOP_LOGGER;
     this.bot = new Telegraf(opts.token);
     this.bot.catch((err, ctx) => {
@@ -200,6 +203,7 @@ export class TelegramAdapter implements InterfaceAdapter {
     this.pending.clear();
     this.modifyContext.clear();
     this.lastListByChat.clear();
+    this.inflightBySession.clear();
   }
 
   // ----------------------------------------------------------------
@@ -675,80 +679,106 @@ export class TelegramAdapter implements InterfaceAdapter {
   /**
    * Type `text` into a session's pane, hold a "typing..." indicator while the
    * agent works, then reply with the response when it settles.
-   * Shared by `onText` and `onVoice`.
+   * Shared by `onText`, `onVoice`, and image handlers.
+   *
+   * Concurrency: deliveries are serialized per session. Two messages sent
+   * back-to-back will run in order rather than racing two pollers on the
+   * same pane (which used to cause Handler B to capture Handler A's
+   * response and Handler B's actual response to be lost).
    *
    * Response priority:
    *   1. last_assistant from the JSONL (clean markdown text, no TUI chrome)
    *   2. cleaned visible pane output (fallback if JSONL isn't ready)
-   *
-   * `prefix` — optional text shown above the response (e.g. transcript echo).
-   * Combining them into one message avoids the "two separate messages" UX.
    */
   private async deliverPromptAndStream(
     ctx: Context,
     sessions: SessionService,
     sessionId: string,
     text: string,
-    prefix?: string,
   ): Promise<void> {
-    try {
-      await sessions.sendInput(sessionId, text);
-    } catch (err) {
-      const msg = (err as Error).message;
-      if (msg.includes("unknown session")) {
-        await ctx.reply(
-          "Session unreachable — it was lost when the worker restarted.\n" +
-          "Use /list then /resume to reconnect.",
-        );
-      } else {
-        await ctx.reply(`Could not send message: ${msg}`);
-      }
-      return;
-    }
     const chatId = ctx.chat?.id;
     if (chatId === undefined) return;
 
-    // Send a visible "working" message immediately so the user knows Claude is
-    // active even during a long response. We delete it when the reply arrives.
-    let workingMsgId: number | null = null;
-    try {
-      const m = await ctx.reply("⏳ Working...");
-      workingMsgId = m.message_id;
-    } catch { /* non-fatal */ }
+    // CRITICAL: the read of `prev` and the set of `wrapped` MUST happen in one
+    // synchronous block (no awaits between them). Otherwise two handlers can
+    // both observe the same stale `prev` while waiting on an early await, and
+    // chain off the same predecessor instead of forming a proper chain.
+    const prev = this.inflightBySession.get(sessionId);
 
-    // Also keep sending the chat "typing" action as a secondary signal.
-    const typingTimer = setInterval(() => {
-      void ctx.telegram.sendChatAction(chatId, "typing").catch(() => {});
-    }, 4000);
-    typingTimer.unref?.();
+    const work = (async (): Promise<void> => {
+      // 1. Immediate UI feedback. "Queued" if there's a predecessor, otherwise
+      //    straight to "Working".
+      let workingMsgId: number | null = null;
+      try {
+        const m = await ctx.reply(prev ? "⏳ Queued..." : "⏳ Working...");
+        workingMsgId = m.message_id;
+      } catch { /* non-fatal */ }
 
-    const deleteWorking = () => {
-      if (workingMsgId !== null) {
-        void ctx.telegram.deleteMessage(chatId, workingMsgId).catch(() => {});
-        workingMsgId = null;
+      // 2. Wait our turn.
+      if (prev) {
+        try { await prev; } catch { /* don't let predecessor failures block us */ }
+        if (workingMsgId !== null) {
+          try {
+            await ctx.telegram.editMessageText(chatId, workingMsgId, undefined, "⏳ Working...");
+          } catch { /* non-fatal */ }
+        }
       }
-    };
 
-    try {
-      const paneText = await this.waitForStablePane(sessions, sessionId);
+      const deleteWorking = () => {
+        if (workingMsgId !== null) {
+          void ctx.telegram.deleteMessage(chatId, workingMsgId).catch(() => {});
+          workingMsgId = null;
+        }
+      };
 
-      // Primary: read the response from the JSONL — clean prose, no TUI chrome.
-      const meta = await sessions.getDiscoveredSession(sessionId).catch(() => null);
-      const responseText = meta?.last_assistant?.trim();
-      const body = responseText ?? cleanPaneText(paneText);
-      deleteWorking();
-      if (body) {
-        const full = prefix ? `${prefix}\n\n${body}` : body;
-        await this.deliverResponse(ctx, sessions, chatId, full);
-      } else {
-        await ctx.reply("(Claude is ready — send a message to get a response)");
+      // 3. Drive the session.
+      try {
+        await sessions.sendInput(sessionId, text);
+      } catch (err) {
+        deleteWorking();
+        const msg = (err as Error).message;
+        if (msg.includes("unknown session")) {
+          await ctx.reply(
+            "Session unreachable — it was lost when the worker restarted.\n" +
+            "Use /list then /resume to reconnect.",
+          );
+        } else {
+          await ctx.reply(`Could not send message: ${msg}`);
+        }
+        return;
       }
-    } catch (err) {
-      deleteWorking();
-      await ctx.reply(`(could not capture response: ${(err as Error).message})`);
-    } finally {
-      clearInterval(typingTimer);
-    }
+
+      const typingTimer = setInterval(() => {
+        void ctx.telegram.sendChatAction(chatId, "typing").catch(() => {});
+      }, 4000);
+      typingTimer.unref?.();
+
+      try {
+        const paneText = await this.waitForStablePane(sessions, sessionId);
+        const meta = await sessions.getDiscoveredSession(sessionId).catch(() => null);
+        const responseText = meta?.last_assistant?.trim();
+        const body = responseText ?? cleanPaneText(paneText);
+        deleteWorking();
+        if (body) {
+          await this.deliverResponse(ctx, sessions, chatId, body);
+        } else {
+          await ctx.reply("(Claude is ready — send a message to get a response)");
+        }
+      } catch (err) {
+        deleteWorking();
+        await ctx.reply(`(could not capture response: ${(err as Error).message})`);
+      } finally {
+        clearInterval(typingTimer);
+      }
+    })();
+
+    const wrapped = work.finally(() => {
+      if (this.inflightBySession.get(sessionId) === wrapped) {
+        this.inflightBySession.delete(sessionId);
+      }
+    });
+    this.inflightBySession.set(sessionId, wrapped);
+    await wrapped;
   }
 
   /**
@@ -846,34 +876,43 @@ export class TelegramAdapter implements InterfaceAdapter {
   }
 
   /**
-   * Poll the session's visible pane until two consecutive captures are
-   * byte-identical, then return that snapshot. Caps at maxWaitMs.
+   * Wait for the session's pane to indicate "Claude is done responding".
    *
-   * Two-phase:
-   *   1. Wait for pane to change from its pre-response baseline (Claude starts).
-   *   2. Wait for pane to stabilize (2 identical consecutive captures = done).
+   * The reliable signal is the Claude Code status bar — when Claude is
+   * working, the visible pane contains a line like:
+   *   `✳ Gusting… (1m 37s · ↓ 7.3k tokens)`
+   * The `[↑↓] N tokens` pattern is unique to the working state.
    *
-   * Without phase 1, the pane looks stable during Claude's "thinking" pause
-   * and we'd return before the response actually appears.
+   * State machine:
+   *   before  → status bar absent; haven't seen Claude start yet
+   *   working → status bar present; Claude is actively responding
+   *   settling → status bar just disappeared; verify with a stable tick
+   *              (handles the brief render lag after the bar clears)
+   *
+   * This handles long responses correctly (mid-stream pauses no longer
+   * look like "done") and fast responses too (if we miss the working
+   * state, we fall back to "pane changed from baseline → settle").
    */
   private async waitForStablePane(
     sessions: SessionService,
     sessionId: string,
   ): Promise<string> {
     const start = Date.now();
-    let lastSeen = "";
-    let previous: string | null = null;
+    let lastRaw = "";
+    let previousCleaned: string | null = null;
     let stableCount = 0;
 
-    // Capture baseline so we know what the pane looked like before the response.
-    let baseline: string | null = null;
+    // Capture baseline.
+    let baselineRaw: string | null = null;
+    let baselineCleaned: string | null = null;
     try {
       const initial = await sessions.capturePane(sessionId, { visibleOnly: true });
-      baseline = initial.text;
-    } catch { /* if initial capture fails, skip phase 1 */ }
+      baselineRaw = initial.text;
+      baselineCleaned = cleanPaneText(initial.text);
+    } catch { /* baseline failed; we'll fall through with state=before */ }
 
-    // Phase 1 is done when we see a change from baseline (or if baseline capture failed).
-    let activitySeen = baseline === null;
+    type State = "before" | "working" | "settling";
+    let state: State = baselineRaw !== null && isClaudeWorking(baselineRaw) ? "working" : "before";
 
     while (Date.now() - start < this.maxWaitMs) {
       await new Promise((r) => setTimeout(r, this.pollIntervalMs));
@@ -884,29 +923,49 @@ export class TelegramAdapter implements InterfaceAdapter {
         this.logger.warn({ err, sessionId }, "capture during poll failed");
         continue;
       }
-      lastSeen = cap.text;
+      lastRaw = cap.text;
+      const cleaned = cleanPaneText(cap.text);
+      const working = isClaudeWorking(cap.text);
 
-      // Phase 1: wait until the pane differs from baseline (Claude started responding).
-      if (!activitySeen) {
-        if (cap.text !== baseline) {
-          activitySeen = true;
-          previous = cap.text;
+      if (state === "before") {
+        if (working) {
+          state = "working";
+        } else if (baselineCleaned !== null && cleaned !== baselineCleaned) {
+          // Claude finished before we caught the status bar — go straight to settle.
+          state = "settling";
+          previousCleaned = cleaned;
           stableCount = 0;
         }
         continue;
       }
 
-      // Phase 2: wait for the pane to stabilize.
-      if (cap.text === previous) {
+      if (state === "working") {
+        if (!working) {
+          // Status bar just disappeared — start the settle phase.
+          state = "settling";
+          previousCleaned = cleaned;
+          stableCount = 0;
+        }
+        // Otherwise still working — keep waiting, no timeout pressure.
+        continue;
+      }
+
+      // settling
+      if (working) {
+        // Claude kicked off another turn (e.g., chained tool call) — back to working.
+        state = "working";
+        continue;
+      }
+      if (cleaned === previousCleaned) {
         stableCount += 1;
         if (stableCount >= this.stableTicks) return cap.text;
       } else {
-        previous = cap.text;
+        previousCleaned = cleaned;
         stableCount = 0;
       }
     }
     // Timed out — return whatever we last saw so the user gets something useful.
-    return lastSeen;
+    return lastRaw;
   }
 
   private async onPhoto(ctx: Context): Promise<void> {
@@ -1127,12 +1186,24 @@ function mimeToExt(mime: string): string {
 }
 
 /**
+ * Detect whether the visible pane currently shows Claude's "working"
+ * status line. The unique signature is the up/down arrow with token
+ * counts, e.g. `↓ 7.3k tokens` or `↑ 240 tokens`. This appears in the
+ * spinner line throughout the entire turn.
+ */
+function isClaudeWorking(raw: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  const t = raw.replace(/\x1b\[[\d;]*[A-Za-z]/g, "");
+  return /[↑↓]\s*[\d.]+k?\s*tokens?/i.test(t);
+}
+
+/**
  * Strip TUI chrome from a raw tmux pane capture so the output reads like
  * a normal conversation instead of a terminal screenshot.
  *
  * Removes: ANSI escape sequences, box-drawing border lines, the Claude
- * status bar ("N tokens · esc to interrupt"), and collapses excessive
- * blank lines.
+ * status bar (spinner + tokens), the keyboard hint line, the shell
+ * prompt line, and collapses excessive blank lines.
  */
 function cleanPaneText(raw: string): string {
   // Strip ANSI escape sequences (color, cursor movement, etc.)
@@ -1145,10 +1216,15 @@ function cleanPaneText(raw: string): string {
     const t = line.trimEnd();
     // Skip lines that are purely box-drawing / border chrome
     if (!t || /^[\s╭╰╮╯│─┤├┼┘└┐┌]+$/.test(t)) continue;
-    // Skip the Claude status bar: "Claude ●  42 tokens · esc to interrupt"
+    // Skip the Claude spinner/status line: "✳ Gusting… (1m 37s · ↓ 7.3k tokens)"
+    if (/[↑↓]\s*[\d.]+k?\s*tokens?/i.test(t)) continue;
+    // Legacy "Claude ●  42 tokens · esc to interrupt" + bare "esc to interrupt"
     if (/\d+\s*tokens?\b/i.test(t) && /esc\s+to\s+interrupt/i.test(t)) continue;
-    // Skip bare "esc to interrupt" lines
     if (/^\s*esc\s+to\s+interrupt\s*$/i.test(t)) continue;
+    // Skip the keyboard-hint footer: "⏵⏵ accept edits on (shift+tab to cycle)"
+    if (/^\s*⏵⏵\s+/.test(t)) continue;
+    // Skip the user's shell prompt line (zsh/oh-my-zsh style)
+    if (/^\s*➜\s+\S+\s+git:/.test(t)) continue;
     cleaned.push(t);
   }
 
